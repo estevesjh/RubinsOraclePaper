@@ -1,16 +1,14 @@
-"""Generate figures for the twilight forecasting paper v2.
+"""Generate figures for the twilight forecasting paper.
 
 Includes NBEATSx-Ridge model from paper_results_v2.csv.
 
-Figures (numbered to match PDF order):
+Figures (matching main.tex):
 - Fig 0: Dataset overview (full year + representative week)
-- Fig 1: Residuals vs Time-to-Twilight (slope recovery pattern)
 - Fig 2: RMSE heatmap (model x lead time)
-- Fig 3: RMSE vs Lead Time (line plot with noise floor)
-- Fig 4: Error histograms at 3h lead time
 - Fig 5: CDF of absolute error
 - Fig 6: Seasonal and temperature trend analysis
 - Fig 7: Rate (dT/dt) forecast results
+- Fig 8: Model comparison (NBEATSx-Ridge vs Prophet vs MeteoBlue)
 """
 
 import sys
@@ -39,16 +37,6 @@ COLORS = {
 MODEL_ORDER = [
     "Persistence",
     "Persistence-Twilight",
-    "Linear",
-    "RandomForest",
-    "MLP",
-    "NBEATSx-Oracle",
-    "NBEATSx-Ridge",
-]
-
-# Models to include in lead-time dependent plots (exclude Persistence-Twilight)
-MODEL_ORDER_LEAD_TIME = [
-    "Persistence",
     "Linear",
     "RandomForest",
     "MLP",
@@ -437,61 +425,6 @@ def fig2_rmse_heatmap():
     print("  Saved fig2_rmse_heatmap.png/pdf")
 
 
-def fig4_error_histograms_3h():
-    """Figure 4: Error histograms at 3h lead time."""
-    print("Generating Figure 4: Error histograms at 3h...")
-
-    results = load_results()
-    at_3h = results[results["lead_time_hours"] == 3.0]
-
-    models = [m for m in MODEL_ORDER if m in at_3h["model"].unique()]
-    n_models = len(models)
-    n_rows = (n_models + 2) // 3
-
-    fig, axes = plt.subplots(n_rows, 3, figsize=(14, 4 * n_rows))
-    axes = axes.flatten()
-
-    for i, model in enumerate(models):
-        ax = axes[i]
-        model_data = at_3h[at_3h["model"] == model]
-
-        ax.hist(
-            model_data["error"],
-            bins=30,
-            alpha=0.7,
-            color=COLORS.get(model, "gray"),
-            edgecolor="black",
-        )
-        ax.axvline(0, color="black", linestyle="--", linewidth=1)
-        ax.axvline(
-            model_data["error"].mean(),
-            color="red",
-            linestyle="-",
-            linewidth=2,
-            label=f"Bias: {model_data['error'].mean():.2f}C",
-        )
-
-        rmse = np.sqrt(np.mean(model_data["error"] ** 2))
-        ax.set_title(f"{model}\nRMSE: {rmse:.2f}C")
-        ax.set_xlabel("Error (C)")
-        ax.set_ylabel("Count")
-        ax.legend(loc="upper right", fontsize=8)
-        ax.set_xlim(-5, 5)
-
-    # Hide unused axes
-    for i in range(n_models, len(axes)):
-        axes[i].set_visible(False)
-
-    plt.suptitle("Error Distributions at 3h Lead Time", fontsize=14, y=1.02)
-    plt.tight_layout()
-    plt.savefig(
-        FIGURES_PATH / "fig4_error_histograms_3h.png", dpi=150, bbox_inches="tight"
-    )
-    plt.savefig(FIGURES_PATH / "fig4_error_histograms_3h.pdf", bbox_inches="tight")
-    plt.close()
-    print("  Saved fig4_error_histograms_3h.png/pdf")
-
-
 def paper_ticks(ax):
     ax.minorticks_on()
     ax.tick_params(
@@ -626,127 +559,6 @@ def fig5_cdf_absolute_error():
     plt.savefig(FIGURES_PATH / "fig5_cdf_error.pdf", bbox_inches="tight")
     plt.close()
     print("  Saved fig5_cdf_error.png/pdf")
-
-
-def compute_noise_floor():
-    """Compute intrinsic uncertainty by lead time (hours to twilight).
-
-    Intrinsic uncertainty = sqrt(instrumental_noise^2 + temp_variation_15min^2)
-    - instrumental_noise: median(tempMax - tempMin) / 4.0 (Gaussian with n=30: d_30 ≈ 4.0)
-    - temp_variation_15min: std of temperature variation rate over 15-min intervals
-    """
-    # Load raw data with tempMax/tempMin
-    df_raw = pd.read_csv(DATA_PATH)
-    df_raw["timestamp"] = pd.to_datetime(df_raw["timestamp"])
-    df_raw = df_raw.sort_values("timestamp")
-
-    # 15-min temperature change (data is 15-min intervals)
-    df_raw["temp_diff_15min"] = df_raw["y"] - df_raw["y"].shift(1)
-
-    # Load twilight offset predictions (has hour_to_tw)
-    offset_file = RESULTS_PATH / "twilight_offset_predictions.csv"
-    df_tw = pd.read_csv(offset_file)
-    df_tw["target_time"] = pd.to_datetime(df_tw["target_time"])
-
-    # Merge to get tempMax/tempMin with hour_to_tw
-    df_raw["target_time"] = df_raw["timestamp"]
-    df = (
-        df_tw[["target_time", "hour_to_tw"]]
-        .drop_duplicates()
-        .merge(
-            df_raw[["target_time", "tempMax", "tempMin", "y", "temp_diff_15min"]],
-            on="target_time",
-            how="left",
-        )
-    )
-
-    # hour_to_tw is negative before twilight; convert to positive lead time
-    df["lead_time"] = -df["hour_to_tw"]
-
-    # Filter to 0-12h before twilight
-    df = df[(df["lead_time"] >= 0) & (df["lead_time"] <= 12)].copy()
-
-    # Bin by lead time (0.5h bins)
-    bins = np.arange(0, 13, 0.5)
-    df["lt_bin"] = pd.cut(df["lead_time"], bins=bins)
-
-    noise_by_lt = []
-    for lt_bin in df["lt_bin"].dropna().unique():
-        subset = df[df["lt_bin"] == lt_bin]
-        if len(subset) > 10:
-            # Instrumental noise: convert range to std (Gaussian with n=30 samples: d_30 ≈ 4.0)
-            inst_noise = (subset["tempMax"] - subset["tempMin"]).median() / 4.0
-            # Temperature variation over 15-min intervals (std)
-            var_15min = subset["temp_diff_15min"].std()
-            # Add in quadrature
-            noise_floor = np.sqrt(inst_noise**2 + var_15min**2)
-            lt_center = (lt_bin.left + lt_bin.right) / 2
-            noise_by_lt.append({"lead_time": lt_center, "noise_floor": noise_floor})
-
-    return pd.DataFrame(noise_by_lt).sort_values("lead_time")
-
-
-def fig3_rmse_vs_lead_time():
-    """Figure 3: RMSE vs Lead Time (line plot) with noise floor."""
-    print("Generating Figure 3: RMSE vs Lead Time...")
-
-    results = load_results()
-    metrics = compute_metrics(results)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    # Exclude Persistence-Twilight (constant across lead times)
-    models = [m for m in MODEL_ORDER_LEAD_TIME if m in metrics["model"].unique()]
-
-    for model in models:
-        model_metrics = metrics[metrics["model"] == model].sort_values(
-            "lead_time_hours"
-        )
-        ax.plot(
-            model_metrics["lead_time_hours"],
-            model_metrics["rmse"],
-            marker="o",
-            label=model,
-            color=COLORS.get(model, "gray"),
-            linewidth=2,
-            markersize=6,
-        )
-
-    # Compute and plot noise floor
-    try:
-        noise_df = compute_noise_floor()
-        ax.plot(
-            noise_df["lead_time"],
-            noise_df["noise_floor"],
-            linestyle="--",
-            color="black",
-            linewidth=2,
-            marker="s",
-            markersize=4,
-            label="Noise floor",
-            alpha=0.8,
-        )
-    except Exception as e:
-        print(f"  Warning: Could not compute noise floor: {e}")
-
-    # Reference line at 1C
-    ax.axhline(1.0, color="gray", linestyle=":", alpha=0.5, label="1°C threshold")
-
-    ax.set_xlabel("Lead Time (hours)")
-    ax.set_ylabel("RMSE (°C)")
-    ax.set_title("RMSE vs Lead Time with Noise Floor")
-    ax.legend(loc="upper left")
-    ax.set_xlim(0, 12.5)
-    ax.set_ylim(0, 3)
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(
-        FIGURES_PATH / "fig3_rmse_vs_lead_time.png", dpi=150, bbox_inches="tight"
-    )
-    plt.savefig(FIGURES_PATH / "fig3_rmse_vs_lead_time.pdf", bbox_inches="tight")
-    plt.close()
-    print("  Saved fig3_rmse_vs_lead_time.png/pdf")
 
 
 def fig6_seasonal_trend_analysis():
@@ -935,106 +747,6 @@ def fig6_seasonal_trend_analysis():
     plt.savefig(FIGURES_PATH / "fig6_seasonal_trend_analysis.pdf", bbox_inches="tight")
     plt.close()
     print("  Saved fig6_seasonal_trend_analysis.png/pdf")
-
-
-def fig1_residuals_vs_time_to_tw():
-    """Figure 1: Residuals vs Time-to-Twilight showing slope pattern."""
-    print("Generating Figure 1: Residuals vs Time-to-Twilight...")
-
-    # Load twilight offset predictions
-    offset_file = RESULTS_PATH / "twilight_offset_predictions.csv"
-    df = pd.read_csv(offset_file)
-    df["tw_time"] = pd.to_datetime(df["tw_time"])
-
-    # Filter to relevant range (0 to -12 hours before twilight)
-    df_plot = df[(df["hour_to_tw"] >= -12) & (df["hour_to_tw"] <= 0)].copy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Left panel: Scatter with binned means
-    ax1 = axes[0]
-    ax1.scatter(
-        df_plot["hour_to_tw"],
-        df_plot["res_tw"],
-        alpha=0.1,
-        s=5,
-        c="gray",
-        label="Individual",
-    )
-
-    # Binned means
-    bins = np.arange(-12.5, 0.5, 0.5)
-    df_plot["hour_bin"] = pd.cut(df_plot["hour_to_tw"], bins=bins)
-    binned = df_plot.groupby("hour_bin", observed=True)["res_tw"].agg(
-        ["mean", "std", "count"]
-    )
-    binned["se"] = binned["std"] / np.sqrt(binned["count"])
-    bin_centers = [(b.left + b.right) / 2 for b in binned.index]
-
-    ax1.errorbar(
-        bin_centers,
-        binned["mean"],
-        yerr=binned["se"],
-        fmt="o-",
-        color="red",
-        linewidth=2,
-        markersize=6,
-        capsize=3,
-        label="Binned mean",
-    )
-
-    # Linear fit
-    x = df_plot["hour_to_tw"].values
-    y = df_plot["res_tw"].values
-    z = np.polyfit(x, y, 1)
-    p = np.poly1d(z)
-    x_line = np.linspace(-12, 0, 100)
-    ax1.plot(
-        x_line, p(x_line), "b--", linewidth=2, label=f"Linear fit: slope={z[0]:.3f}"
-    )
-
-    ax1.axhline(0, color="black", linestyle="-", linewidth=0.5)
-    ax1.set_xlabel("Hours to Twilight")
-    ax1.set_ylabel("Residual (Actual - Approx) [C]")
-    ax1.set_title("NBEATSx Residual Pattern Before Ridge Correction")
-    ax1.legend(loc="upper left")
-    ax1.set_xlim(-12.5, 0.5)
-    ax1.grid(True, alpha=0.3)
-
-    # Right panel: Distribution at different lead times
-    ax2 = axes[1]
-    lead_times = [-3, -6, -9, -12]
-    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(lead_times)))
-
-    for lt, color in zip(lead_times, colors):
-        subset = df_plot[
-            (df_plot["hour_to_tw"] >= lt - 0.5) & (df_plot["hour_to_tw"] < lt + 0.5)
-        ]
-        if len(subset) > 0:
-            ax2.hist(
-                subset["res_tw"],
-                bins=30,
-                alpha=0.5,
-                color=color,
-                label=f"{abs(lt)}h (n={len(subset)}, mean={subset['res_tw'].mean():.2f})",
-                density=True,
-            )
-
-    ax2.axvline(0, color="black", linestyle="--", linewidth=1)
-    ax2.set_xlabel("Residual [C]")
-    ax2.set_ylabel("Density")
-    ax2.set_title("Residual Distribution by Lead Time")
-    ax2.legend(loc="upper left", fontsize=9)
-    ax2.set_xlim(-6, 6)
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(
-        FIGURES_PATH / "fig1_residuals_vs_time_to_tw.png", dpi=150, bbox_inches="tight"
-    )
-    plt.savefig(FIGURES_PATH / "fig1_residuals_vs_time_to_tw.pdf", bbox_inches="tight")
-    plt.close()
-    print("  Saved fig1_residuals_vs_time_to_tw.png/pdf")
 
 
 def fig7_rate_forecast():
@@ -1541,12 +1253,9 @@ def main():
     FIGURES_PATH.mkdir(parents=True, exist_ok=True)
     print(f"\nOutput directory: {FIGURES_PATH}")
 
-    # Generate all figures (numbered to match PDF order)
+    # Generate all figures (matching main.tex)
     fig0_dataset_overview()
-    fig1_residuals_vs_time_to_tw()
     fig2_rmse_heatmap()
-    fig3_rmse_vs_lead_time()
-    fig4_error_histograms_3h()
     fig5_cdf_absolute_error()
     fig6_seasonal_trend_analysis()
     fig7_rate_forecast()
