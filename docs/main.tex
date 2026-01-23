@@ -79,7 +79,7 @@ University, Cambridge MA USA 02138}
 
 % Our approach trains NBEATSx to predict the deviation ($\Delta T$) from a linear twilight-to-twilight trend. A secondary Ridge regression stage then recovers the missing slope using lagged residuals and auxiliary features. Using 2+ years of on-site data, NBEATSx-Ridge achieves a Root Mean Square Error (RMSE) of \textbf{0.47$^\circ$C} at the critical 3-hour lead time, outperforming even an Oracle model with access to future data. Leveraging these forecasts, we demonstrate a dual-setpoint control algorithm that achieves a $0.44^{\circ}\text{C}$ RMS tracking error overnight, maintaining the primary mirror within the ideal thermal range for 68\% of observing time.
 
-Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to meet the stringent image quality requirements of the Legacy Survey of Space and Time (LSST). Specifically, minimizing temperature differentials between the primary mirror, dome air, and ambient environment is critical to mitigate both \textbf{dome seeing} and \textbf{mirror seeing}. Traditional Numerical Weather Prediction (NWP) models often fail to provide the necessary local precision due to persistent biases. To address this, we present a comprehensive comparison of forecasting methods across lead times from 0.5 to 12 hours, including Persistence, Linear Regression, Random Forest, MLP, and a two-stage deep learning architecture: \textbf{NBEATSx-Ridge}. Our approach trains NBEATSx to predict the deviation ($\Delta T$) from a linear twilight-to-twilight trend. A secondary Ridge regression stage then recovers the missing slope using lagged residuals and auxiliary features. Using 2+ years of on-site data, NBEATSx-Ridge achieves a Root Mean Square Error (RMSE) of \textbf{0.36$^\circ$C} at the critical 3-hour before twilight time and $99\%$ of forecasts have error below $1^\circ$C, outperforming even an Oracle model with access to future data. Leveraging these forecasts, we demonstrate a dual-setpoint control algorithm that achieves {a $0.44^{\circ}\text{C}$ RMS tracking error overnight \textbf{(to be updated)}}. Crucially, this strategy maintains the primary mirror within the ideal thermal range ($0$ to $0.5^{\circ}\text{C}$ cooler than ambient) for 68\% of observing time, effectively mitigating potential unstable boundary layers responsible for mirror seeing.
+Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to meet the stringent image quality requirements of the Legacy Survey of Space and Time (LSST). Specifically, minimizing temperature differentials between the primary mirror, dome air, and ambient environment is critical to mitigate both dome seeing and mirror seeing. Traditional Numerical Weather Prediction (NWP) models often fail to provide the necessary local precision due to persistent biases. To address this, we present a comprehensive comparison of forecasting methods across lead times from 0.5 to 12 hours, including Persistence, Linear Regression, Random Forest, MLP, and a two-stage deep learning architecture: NBEATSx-Ridge. Our approach trains NBEATSx to predict the deviation ($\Delta T$) from a linear twilight-to-twilight trend. A secondary Ridge regression stage then recovers the missing slope using lagged residuals and auxiliary features. Using 2+ years of on-site data, NBEATSx-Ridge achieves a Root Mean Square Error (RMSE) of 0.36$^\circ$C at the critical 3-hour before twilight time and 99\% of forecasts have error below 1$^\circ$C, outperforming even an Oracle model with access to future data. Leveraging these forecasts, we demonstrate a dual-setpoint control algorithm that achieves a $0.44^{\circ}\text{C}$ RMS tracking error overnight (to be updated). Crucially, this strategy maintains the primary mirror within the ideal thermal range ($0$ to $0.5^{\circ}\text{C}$ cooler than ambient) for 68\% of observing time, effectively mitigating potential unstable boundary layers responsible for mirror seeing.
 
 \end{abstract}
 
@@ -91,14 +91,14 @@ Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to m
 \label{sec:intro}
 
 
-The performance of ground-based optical observatories depends critically on image quality and thermal control. One of the key challenges is the mitigation of \emph{dome seeing}, which arises from temperature gradients between the interior and exterior of the telescope enclosure \citep{Racine1991, Emelianov2015}. Dome air conditioning (HVAC) systems are designed to reduce these gradients by matching the internal air temperature to the outside ambient temperature. However, the effectiveness of this pre-cooling strategy depends on anticipating the outside temperature well in advance. This predictive capability is most critical during the \textbf{twilight transition} (sunset), when the dome is first opened and the massive thermal inertia of the telescope structure makes maintaining thermal equilibrium particularly difficult.
+The performance of ground-based optical observatories depends critically on image quality and thermal control. One of the key challenges is the mitigation of \emph{dome seeing}, which arises from temperature gradients between the interior and exterior of the telescope enclosure \citep{Racine1991, Emelianov2015}. Dome air conditioning (HVAC) systems are designed to reduce these gradients by matching the internal air temperature to the outside ambient temperature. However, the effectiveness of this pre-cooling strategy depends on anticipating the outside temperature well in advance. This predictive capability is most critical during the twilight transition (sunset), when the dome is first opened and the massive thermal inertia of the telescope structure makes maintaining thermal equilibrium particularly difficult.
 
-For the \textbf{Vera C. Rubin Observatory} \citep{ivezic19}, this challenge is magnified because the Legacy Survey of Space and Time (LSST) requires rapid data acquisition and exceptionally consistent image quality across a wide field of view \citep{Esteves2023}. To mitigate dome seeing, Rubin employs a sophisticated Ventilation and Air Conditioning (\textbf{HVAC}) system that actively preconditions the enclosure and mirror to track the outside temperature. Yet, the operational efficiency of this active control system depends on the precision forecast of the outside air temperature, which remains a non-trivial operational challenge.
+For the Vera C. Rubin Observatory \citep{ivezic19}, this challenge is magnified because the Legacy Survey of Space and Time (LSST) requires rapid data acquisition and exceptionally consistent image quality across a wide field of view \citep{Esteves2023}. To mitigate dome seeing, Rubin employs a sophisticated Ventilation and Air Conditioning (HVAC) system that actively preconditions the enclosure and mirror to track the outside temperature. Yet, the operational efficiency of this active control system depends on the precision forecast of the outside air temperature, which remains a non-trivial operational challenge.
 
 
-Traditional Numerical Weather Prediction (NWP) models from ECMWF, GFS, or commercial services like MeteoBlue struggle with site-specific predictions at high-altitude sites like Cerro Pach\'on due to coarse spatial resolution and inadequate boundary layer parameterizations. Following \citet{Buffa1997}, who demonstrated neural networks for dome temperature prediction, the Rubin Observatory deployed a \textbf{Prophet}-based \citep{Taylor2017} forecasting system using local weather station data \footnote{\url{https://rubin-weather-forecast.jesteves.workers.dev}}. While this eliminated global forecast biases, higher precision is required for autonomous thermal control.
+Traditional Numerical Weather Prediction (NWP) models from ECMWF, GFS, or commercial services like MeteoBlue struggle with site-specific predictions at high-altitude sites like Cerro Pach\'on due to coarse spatial resolution and inadequate boundary layer parameterizations. Following \citet{Buffa1997}, who demonstrated neural networks for dome temperature prediction, the Rubin Observatory deployed a Prophet-based \citep{Taylor2017} forecasting system using local weather station data \footnote{\url{https://rubin-weather-forecast.jesteves.workers.dev}}. While this eliminated global forecast biases, higher precision is required for autonomous thermal control.
 
-In this work, we present \textbf{NBEATSx-Ridge}, a two-stage deep learning architecture using \textbf{NBEATSx} \citep{Olivares2021} to model the temperature offset $\Delta T$ from a twilight-to-twilight linear trend. A secondary Ridge regression stage recovers daily trend dynamics. We compare this approach against Persistence, Linear Regression, Random Forest, and MLP baselines, demonstrating that NBEATSx-Ridge achieves noise-floor-limited precision necessary for optimal thermal control.
+In this work, we present NBEATSx-Ridge, a two-stage deep learning architecture using NBEATSx \citep{Olivares2021} to model the temperature offset $\Delta T$ from a twilight-to-twilight linear trend. A secondary Ridge regression stage recovers daily trend dynamics. We compare this approach against Persistence, Linear Regression, Random Forest, and MLP baselines, demonstrating that NBEATSx-Ridge achieves noise-floor-limited precision necessary for optimal thermal control.
 
 % The primary challenge for modern optical observatories to preserve high \textbf{image quality} is the precise \textbf{thermal control} of the telescope \textbf{dome} and enclosure. A major limiting factor to delivered image quality is the mitigation of \emph{dome seeing}, which arises from temperature gradients between the interior and exterior of the enclosure \citep{Racine1991}. 
 
@@ -138,15 +138,15 @@ This section describes the forecasting models evaluated in this study, progressi
 
 \subsection{Baseline Models}
 
-We evaluate six baseline approaches to establish performance benchmarks. \textbf{Persistence} uses the temperature at forecast time as the prediction for twilight, capturing autocorrelation but failing to account for systematic diurnal trends. \textbf{Linear Regression} (Ridge-regularized) incorporates 24 hourly temperature lags, momentum features (1-hour and 3-hour temperature differences), and cyclical twilight position encoding. \textbf{Random Forest} uses the same feature set with 100 trees and maximum depth of 10, capturing nonlinear interactions between features. \textbf{Multi-Layer Perceptron (MLP)} employs two hidden layers (64 and 32 units) with standard scaling applied to inputs.
+We evaluate six baseline approaches to establish performance benchmarks. Persistence uses the temperature at forecast time as the prediction for twilight, capturing autocorrelation but failing to account for systematic diurnal trends. Linear Regression (Ridge-regularized) incorporates 24 hourly temperature lags, momentum features (1-hour and 3-hour temperature differences), and cyclical twilight position encoding. Random Forest uses the same feature set with 100 trees and maximum depth of 10, capturing nonlinear interactions between features. Multi-Layer Perceptron (MLP) employs two hidden layers (64 and 32 units) with standard scaling applied to inputs.
 
-We also compare against two external forecasting systems. \textbf{Prophet-BMA} is a two-component Prophet system combining short-term and long-term models via Bayesian Model Averaging, with weighting $\alpha(h) = 0.9 \cdot \exp(-h/13)$ that allows the short-term model to dominate at small lead times while transitioning to the stable long-term model at longer horizons. \textbf{MeteoBlue} is a commercial numerical weather prediction service providing hourly temperature forecasts for the Cerro Pach\'on site, representing an external baseline independent of on-site sensor data.
+We also compare against two external forecasting systems. Prophet-BMA is a two-component Prophet system combining short-term and long-term models via Bayesian Model Averaging, with weighting $\alpha(h) = 0.9 \cdot \exp(-h/13)$ that allows the short-term model to dominate at small lead times while transitioning to the stable long-term model at longer horizons. MeteoBlue is a commercial numerical weather prediction service providing hourly temperature forecasts for the Cerro Pach\'on site, representing an external baseline independent of on-site sensor data.
 
 \subsection{NBEATSx Architecture}
 
 We employ NBEATSx \citep{Olivares2021}, an extension of N-BEATS \citep{Oreshkin2019} that incorporates exogenous variables. The architecture consists of three specialized stacks: a \emph{trend stack} using polynomial basis functions for day-to-day drift, a \emph{seasonality stack} using Fourier basis functions for diurnal cycles, and an \emph{exogenous stack} for external covariates. Each stack produces backcasts subtracted hierarchically, allowing subsequent blocks to model refined residuals.
 
-The model incorporates \textbf{historical features} (raw temperature, last sunrise temperature, four diurnal rate features, daily temperature range, high-frequency rate) and a single \textbf{future feature} (twilight position encoding). Training uses a 24-hour lookback window with 12-hour forecast horizon, SELU activation, Huber loss, robust scaling, and learning rate 0.01.
+The model incorporates historical features (raw temperature, last sunrise temperature, four diurnal rate features, daily temperature range, high-frequency rate) and a single future feature (twilight position encoding). Training uses a 24-hour lookback window with 12-hour forecast horizon, SELU activation, Huber loss, robust scaling, and learning rate 0.01.
 
 \subsection{Two-Stage Architecture: NBEATSx-Ridge}
 
@@ -194,7 +194,7 @@ A striking feature of NBEATSx-Ridge is its stability across lead times---RMSE re
 
 \begin{figure}[!htb]
     \centering
-    \includegraphics[width=0.97\columnwidth]{fig2_rmse_heatmap.pdf}
+    \includegraphics[width=\columnwidth]{fig2_rmse_heatmap.pdf}
     \caption{RMSE heatmap by model and lead time. Lower values (cooler colors) indicate better performance. NBEATSx-Ridge achieves the lowest errors across all lead times, maintaining RMSE below 0.75$^\circ$C. Traditional machine learning models (RandomForest, MLP) and Prophet-BMA show gradual degradation at longer lead times, while Persistence baseline deteriorates as expected.}
     \label{fig:rmse_heatmap}
 \end{figure}
@@ -204,7 +204,7 @@ A striking feature of NBEATSx-Ridge is its stability across lead times---RMSE re
 
 The 3-hour lead time is operationally critical for the Rubin Observatory thermal control system. Approximately 3 hours before twilight, the dome is opened and the HVAC system is turned off. At this point, the M1M3 refrigeration system begins actively matching the temperature of the primary mirror to the top end assembly (where the secondary mirror M2 and camera reside). The twilight temperature forecast issued at this moment directly determines the thermal setpoints for the remainder of the pre-observation period.
 
-Table~\ref{tab:3h_metrics} presents detailed metrics for all models at the 3-hour lead time. NBEATSx-Ridge achieves the best performance across all metrics. With an RMSE of \textbf{0.36$^\circ$C} and MAE of 0.28$^\circ$C, it represents an 85\% improvement over Persistence (2.42$^\circ$C) and a 66\% improvement over traditional ML methods (RandomForest, MLP; $\sim$1.1$^\circ$C). The median absolute error of 0.26$^\circ$C indicates that half of all predictions are within 0.3$^\circ$C of the actual twilight temperature.
+Table~\ref{tab:3h_metrics} presents detailed metrics for all models at the 3-hour lead time. NBEATSx-Ridge achieves the best performance across all metrics. With an RMSE of 0.36$^\circ$C and MAE of 0.28$^\circ$C, it represents an 85\% improvement over Persistence (2.42$^\circ$C) and a 66\% improvement over traditional ML methods (RandomForest, MLP; $\sim$1.1$^\circ$C). The median absolute error of 0.26$^\circ$C indicates that half of all predictions are within 0.3$^\circ$C of the actual twilight temperature.
 
 \begin{table}[htb!]
 \centering
@@ -222,14 +222,14 @@ RandomForest & 1.07 & 0.83 & 0.70 & $+$0.00 & 67\% \\
 MLP & 1.06 & 0.85 & 0.74 & $+$0.02 & 66\% \\
 NBEATSx-Oracle & 0.79 & 0.64 & 0.51 & $-$0.44 & 77\% \\
 \midrule
-\textbf{NBEATSx-Ridge} & \textbf{0.36} & \textbf{0.28} & \textbf{0.26} & $-$0.02 & \textbf{99\%} \\
+NBEATSx-Ridge & 0.36 & 0.28 & 0.26 & $-$0.02 & 99\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The bias analysis reveals an important advantage of the two-stage approach. NBEATSx-Oracle exhibits a systematic negative bias of $-$0.44$^\circ$C, meaning it consistently overpredicts twilight temperature. The Ridge correction not only recovers the unknown slope but also corrects this bias, reducing it to just $-$0.02$^\circ$C overall. This near-zero bias is operationally valuable as it ensures thermal control setpoints are centered on the true expected temperature.
 
-Most importantly for operational deployment, NBEATSx-Ridge achieves \textbf{99\%} of predictions within 1$^\circ$C of the actual temperature, compared to 77\% for NBEATSx-Oracle and only 17\% for Persistence. This high reliability directly addresses the observatory's thermal control requirements for minimizing dome seeing at the start of observations.
+Most importantly for operational deployment, NBEATSx-Ridge achieves 99\% of predictions within 1$^\circ$C of the actual temperature, compared to 77\% for NBEATSx-Oracle and only 17\% for Persistence. This high reliability directly addresses the observatory's thermal control requirements for minimizing dome seeing at the start of observations.
 
 \subsection{Early Forecast Availability for Operational Planning}
 \label{sec:results:morning}
@@ -255,7 +255,7 @@ Time (Chile) & RMSE & $<$1$^\circ$C & Bias \\
 \end{tabular}
 \end{table}
 
-The results demonstrate that reliable forecasts are available throughout the morning. By 10:00 local time, NBEATSx-Ridge achieves \textbf{0.62$^\circ$C RMSE} with \textbf{90\%} of predictions within 1$^\circ$C---sufficient precision for early thermal planning decisions. The consistent near-zero bias ($\sim$$-$0.05$^\circ$C) across all time windows ensures that thermal setpoints are not systematically offset. Forecast accuracy improves gradually as the day progresses and more temperature history becomes available, reaching 0.55$^\circ$C RMSE by early afternoon.
+The results demonstrate that reliable forecasts are available throughout the morning. By 10:00 local time, NBEATSx-Ridge achieves 0.62$^\circ$C RMSE with 90\% of predictions within 1$^\circ$C---sufficient precision for early thermal planning decisions. The consistent near-zero bias ($\sim$$-$0.05$^\circ$C) across all time windows ensures that thermal setpoints are not systematically offset. Forecast accuracy improves gradually as the day progresses and more temperature history becomes available, reaching 0.55$^\circ$C RMSE by early afternoon.
 
 \subsection{Cumulative Distribution of Errors}
 
@@ -325,9 +325,9 @@ During operational forecasting, when the future twilight rate is unknown, we app
 
 The observed twilight temperature rate at Cerro Pach\'on averages $-0.68^\circ$C/h (cooling), with a standard deviation of $0.38^\circ$C/h and values ranging from $-1.96^\circ$C/h (rapid cooling) to $+0.41^\circ$C/h (slight warming). This variability motivates the need for accurate rate forecasting rather than assuming a fixed cooling rate.
 
-The rate forecasting system employs a multi-window architecture with seven overlapping 3-hour prediction windows. Figure~\ref{fig:rate_forecast} presents the NBEATSx-Ridge rate forecaster performance at the 3-hour lead time. The left panels demonstrate that the forecaster tracks the actual twilight rate with high fidelity: the top-left scatter plot shows NBEATSx-Ridge predictions (cyan) tightly clustered along the 1:1 line, while the bottom-left time series confirms close agreement between predicted and observed rates throughout 2025, capturing both seasonal variations and day-to-day fluctuations. In contrast, the persistence baseline (gray)---which uses the previous twilight's rate---shows substantial scatter. The model achieves an RMSE of \textbf{0.096$^\circ$C/h}, a \textbf{79.7\% improvement} over persistence (0.473$^\circ$C/h).
+The rate forecasting system employs a multi-window architecture with seven overlapping 3-hour prediction windows. Figure~\ref{fig:rate_forecast} presents the NBEATSx-Ridge rate forecaster performance at the 3-hour lead time. The left panels demonstrate that the forecaster tracks the actual twilight rate with high fidelity: the top-left scatter plot shows NBEATSx-Ridge predictions (cyan) tightly clustered along the 1:1 line, while the bottom-left time series confirms close agreement between predicted and observed rates throughout 2025, capturing both seasonal variations and day-to-day fluctuations. In contrast, the persistence baseline (gray)---which uses the previous twilight's rate---shows substantial scatter. The model achieves an RMSE of 0.096$^\circ$C/h, a 79.7\% improvement over persistence (0.473$^\circ$C/h).
 
-The right panels quantify the error statistics: the top-right histogram reveals a symmetric distribution centered near zero with minimal bias (0.007$^\circ$C/h) and MAE of 0.076$^\circ$C/h, while the bottom-right CDF shows that NBEATSx-Ridge achieves \textbf{97\% of predictions within 0.2$^\circ$C/h}, compared to $\sim$5\% for persistence.
+The right panels quantify the error statistics: the top-right histogram reveals a symmetric distribution centered near zero with minimal bias (0.007$^\circ$C/h) and MAE of 0.076$^\circ$C/h, while the bottom-right CDF shows that NBEATSx-Ridge achieves 97\% of predictions within 0.2$^\circ$C/h, compared to $\sim$5\% for persistence.
 
 \begin{figure*}[htb!]
     \centering
@@ -339,7 +339,7 @@ The right panels quantify the error statistics: the top-right histogram reveals 
 \section{Discussion}
 \label{sec:discussion}
 
-The NBEATSx-Ridge framework presented in this work addresses a critical operational requirement for the Vera C. Rubin Observatory: providing highly accurate twilight temperature forecasts with sufficient precision for autonomous thermal control. The model achieves \textbf{99\% of predictions within 1$^\circ$C} at the operationally critical 3-hour lead time, representing substantial improvements over both commercial weather services and legacy statistical approaches.
+The NBEATSx-Ridge framework presented in this work addresses a critical operational requirement for the Vera C. Rubin Observatory: providing highly accurate twilight temperature forecasts with sufficient precision for autonomous thermal control. The model achieves 99\% of predictions within 1$^\circ$C at the operationally critical 3-hour lead time, representing substantial improvements over both commercial weather services and legacy statistical approaches.
 
 \subsection{The $\Delta T$ Formulation}
 
@@ -391,15 +391,15 @@ This twilight temperature forecast system represents a foundational component fo
 We have presented NBEATSx-Ridge, a two-stage deep learning framework for twilight temperature forecasting at the Vera C. Rubin Observatory. Our key findings are:
 
 \begin{enumerate}
-    \item \textbf{State-of-the-art accuracy}: NBEATSx-Ridge achieves RMSE of 0.36$^\circ$C at the 3-hour operational lead time, with 99\% of predictions within 1$^\circ$C of the observed temperature.
+    \item State-of-the-art accuracy: NBEATSx-Ridge achieves RMSE of 0.36$^\circ$C at the 3-hour operational lead time, with 99\% of predictions within 1$^\circ$C of the observed temperature.
 
-    \item \textbf{Superior to baseline methods}: NBEATSx-Ridge (RMSE 0.36$^\circ$C) outperforms Persistence (RMSE 2.42$^\circ$C), traditional ML methods (RandomForest, MLP; RMSE $\sim$1.1$^\circ$C), and even the NBEATSx-Oracle model (RMSE 0.79$^\circ$C) which has access to the true future twilight temperature.
+    \item Superior to baseline methods: NBEATSx-Ridge (RMSE 0.36$^\circ$C) outperforms Persistence (RMSE 2.42$^\circ$C), traditional ML methods (RandomForest, MLP; RMSE $\sim$1.1$^\circ$C), and even the NBEATSx-Oracle model (RMSE 0.79$^\circ$C) which has access to the true future twilight temperature.
 
-    \item \textbf{Novel $\Delta T$ formulation}: By predicting deviations from the Twilight-Trend rather than absolute temperatures, we separate the predictable diurnal cycle from the challenging daily trend variation.
+    \item Novel $\Delta T$ formulation: By predicting deviations from the Twilight-Trend rather than absolute temperatures, we separate the predictable diurnal cycle from the challenging daily trend variation.
 
-    \item \textbf{Robust seasonal performance}: The model maintains consistent accuracy across all seasons, with RMSE varying by less than 0.1$^\circ$C between the best and worst seasons.
+    \item Robust seasonal performance: The model maintains consistent accuracy across all seasons, with RMSE varying by less than 0.1$^\circ$C between the best and worst seasons.
 
-    \item \textbf{Rate forecasting capability}: The same two-stage approach extends to temperature rate prediction, achieving RMSE of 0.096$^\circ$C/h (79.7\% improvement over persistence) with 97\% of predictions within 0.2$^\circ$C/h.
+    \item Rate forecasting capability: The same two-stage approach extends to temperature rate prediction, achieving RMSE of 0.096$^\circ$C/h (79.7\% improvement over persistence) with 97\% of predictions within 0.2$^\circ$C/h.
 \end{enumerate}
 
 The NBEATSx-Ridge framework provides the reliable, unbiased temperature forecasts required for autonomous thermal control of the Rubin Observatory. By substantially improving upon both commercial weather services and legacy statistical approaches, this work enables optimal image quality throughout the Legacy Survey of Space and Time.
