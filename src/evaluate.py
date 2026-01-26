@@ -1,4 +1,4 @@
-"""Generate paper_results_v2.csv with NBEATSx-Ridge predictions.
+"""Generate paper_results_final.csv with NBEATSx-Ridge + Prophet + MeteoBlue.
 
 Two-stage correction approach:
 1. NBEATSx approximates current temperature (nowcast, pred_horizon=0)
@@ -18,6 +18,8 @@ Optimized feature set (20 features, Jan 2026):
 - Lags: res_1, res_3, ..., res_21 (11 odd lags)
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
@@ -28,6 +30,7 @@ from config import (
     RESULTS_PATH,
     PAPER_RESULTS_FILE,
     TWILIGHT_OFFSET_FILE,
+    TWILIGHT_OFFSET_INSAMPLE_FILE,
     PAPER_RESULTS_V2_FILE,
     METRICS_3H_FILE,
     LEAD_TIMES_HOURS,
@@ -35,17 +38,174 @@ from config import (
     RIDGE_ALPHA,
     DATA_PATH,
     SLOPE_FILE,
+    TRAINING_MODE,
 )
 
-# Use config values - switch to iter1 files if using slope correction
+# External forecast paths
+PROPHET_FILE = Path(__file__).parent.parent / "data" / "results_hybrid_07d_30min.csv"
+METEOBLUE_FILE = Path(__file__).parent.parent / "data" / "meteo_blue_weather_station.csv"
+
+
+# =============================================================================
+# External Forecast Functions (Prophet, MeteoBlue)
+# =============================================================================
+
+
+def apply_prophet_blending(df: pd.DataFrame, A: float = 0.90, tau: float = 13.0) -> pd.DataFrame:
+    """Apply exponential blending to Prophet forecasts."""
+    df = df.copy()
+    lead = df["lead_time"].astype(float).to_numpy()
+    f = A * np.exp(-lead / tau)
+    df["y_hat"] = f * df["yhat_short"] + (1 - f) * df["yhat_long"]
+    return df
+
+
+def handle_prophet_failures(df: pd.DataFrame, xi2_tol: float = 2.0) -> pd.DataFrame:
+    """Handle Prophet model failures based on reduced chi-square."""
+    out = df.copy()
+    xi2_long = out["xi2_long_model"].astype(float).to_numpy()
+    xi2_short = out["xi2_short_model"].astype(float).to_numpy()
+    fail_long = np.abs(xi2_long - 1.0) > xi2_tol
+    fail_short = np.abs(xi2_short - 1.0) > xi2_tol
+
+    yhat_new = out["y_hat"].to_numpy(dtype=float)
+    only_long_fail = fail_long & ~fail_short
+    yhat_new[only_long_fail] = out.loc[only_long_fail, "yhat_short"].to_numpy(dtype=float)
+    only_short_fail = fail_short & ~fail_long
+    yhat_new[only_short_fail] = out.loc[only_short_fail, "yhat_long"].to_numpy(dtype=float)
+
+    both_fail = fail_long & fail_short
+    if both_fail.any():
+        d_long = np.abs(xi2_long - 1.0)
+        d_short = np.abs(xi2_short - 1.0)
+        choose_long = d_long <= d_short
+        idx = np.where(both_fail & choose_long)[0]
+        if idx.size:
+            yhat_new[idx] = out.iloc[idx]["yhat_long"].to_numpy(dtype=float)
+        idx = np.where(both_fail & ~choose_long)[0]
+        if idx.size:
+            yhat_new[idx] = out.iloc[idx]["yhat_short"].to_numpy(dtype=float)
+
+    out["y_hat"] = yhat_new
+    return out
+
+
+def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
+    """Extract Prophet-BMA forecasts matched to twilight events."""
+    if not PROPHET_FILE.exists():
+        print("  Prophet file not found, skipping")
+        return pd.DataFrame()
+
+    print("Processing Prophet-BMA forecasts...")
+    TARGET_LEAD_TIMES = [0.5, 1.0, 3.0, 6.0, 9.0, 12.0]
+
+    df = pd.read_csv(PROPHET_FILE)
+    df = df.rename(columns={"timestamp": "valid_time"})
+    df["valid_time"] = pd.to_datetime(df["valid_time"])
+    df = apply_prophet_blending(df)
+    df = handle_prophet_failures(df)
+
+    twilight_events = twilight_events.copy()
+    twilight_events["twilight_time"] = pd.to_datetime(twilight_events["twilight_time"])
+
+    results = []
+    for lt in TARGET_LEAD_TIMES:
+        df_lt = df[np.abs(df["lead_time"] - lt) < 0.1].copy()
+        df_lt = df_lt.sort_values("valid_time").reset_index(drop=True)
+
+        for _, tw_row in twilight_events.iterrows():
+            tw_time = tw_row["twilight_time"]
+            time_diff = np.abs((df_lt["valid_time"] - tw_time).dt.total_seconds())
+            within_window = time_diff < 3600
+
+            if not within_window.any():
+                continue
+
+            closest_idx = time_diff[within_window].idxmin()
+            match = df_lt.loc[closest_idx]
+            actual_temp = match["y"]
+            forecast_temp = match["y_hat"]
+            error = forecast_temp - actual_temp
+
+            if np.abs(error) > 10.0:
+                continue
+
+            results.append({
+                "twilight_time": match["valid_time"],
+                "forecast_time": match["valid_time"] - pd.Timedelta(hours=lt),
+                "lead_time_hours": lt,
+                "actual_temp": actual_temp,
+                "model": "Prophet",
+                "forecast_temp": forecast_temp,
+                "error": error,
+            })
+
+    print(f"  Created {len(results)} Prophet forecasts")
+    return pd.DataFrame(results)
+
+
+def process_meteoblue_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
+    """Extract MeteoBlue forecasts for each twilight event."""
+    if not METEOBLUE_FILE.exists():
+        print("  MeteoBlue file not found, skipping")
+        return pd.DataFrame()
+
+    print("Processing MeteoBlue forecasts...")
+    df = pd.read_csv(METEOBLUE_FILE)
+    df["issue_time"] = pd.to_datetime(df["issue_time"], utc=True)
+    df["valid_time"] = pd.to_datetime(df["valid_time"], utc=True)
+    df = df.sort_values("valid_time").reset_index(drop=True)
+
+    results = []
+    for _, tw_row in twilight_events.iterrows():
+        tw_time = tw_row["twilight_time"]
+        actual_temp = tw_row["actual_temp"]
+
+        tw_time_utc = pd.Timestamp(tw_time).tz_localize("UTC")
+        time_diff = np.abs((df["valid_time"] - tw_time_utc).dt.total_seconds())
+        within_window = time_diff < 7200
+
+        if not within_window.any():
+            continue
+
+        closest_idx = time_diff[within_window].idxmin()
+        match = df.loc[closest_idx]
+
+        lead_time = (match["valid_time"] - match["issue_time"]).total_seconds() / 3600.0
+        forecast_temp = match["temperature"]
+
+        results.append({
+            "twilight_time": tw_time,
+            "forecast_time": match["issue_time"].tz_localize(None),
+            "lead_time_hours": lead_time,
+            "actual_temp": actual_temp,
+            "model": "MeteoBlue",
+            "forecast_temp": forecast_temp,
+            "error": forecast_temp - actual_temp,
+        })
+
+    print(f"  Created {len(results)} MeteoBlue forecasts")
+    return pd.DataFrame(results)
+
+# Use config values - select files based on training mode and slope correction
 PAPER_RESULTS = PAPER_RESULTS_FILE
-if SLOPE_FILE is not None:
+
+if TRAINING_MODE == "operational":
+    # Operational mode: train Ridge on in-sample NBEATSx predictions (pre-2025)
+    TWILIGHT_OFFSET = TWILIGHT_OFFSET_INSAMPLE_FILE
+    OUTPUT_PATH = PAPER_RESULTS_V2_FILE
+    print("*** OPERATIONAL MODE: Training Ridge on in-sample predictions ***")
+elif SLOPE_FILE is not None:
+    # Paper mode with slope correction
     TWILIGHT_OFFSET = RESULTS_PATH / "twilight_offset_predictions_iter1.csv"
     OUTPUT_PATH = RESULTS_PATH / "paper_results_v2_iter1.csv"
-    print("*** ITERATION 1: Using slope-corrected predictions ***")
+    print("*** PAPER MODE (ITERATION 1): Using slope-corrected predictions ***")
 else:
+    # Paper mode (default): train Ridge on 2025 test data with odd/even split
     TWILIGHT_OFFSET = TWILIGHT_OFFSET_FILE
     OUTPUT_PATH = PAPER_RESULTS_V2_FILE
+    print("*** PAPER MODE: Training Ridge on 2025 test data (odd/even split) ***")
+
 LEAD_TIMES = LEAD_TIMES_HOURS
 
 print("=" * 70)
@@ -64,13 +224,37 @@ paper_results["twilight_time"] = pd.to_datetime(paper_results["twilight_time"])
 paper_results["forecast_time"] = pd.to_datetime(paper_results["forecast_time"])
 print(f"  paper_results rows: {len(paper_results)}")
 
-df = pd.read_csv(TWILIGHT_OFFSET)
-df["tw_date"] = pd.to_datetime(df["tw_date"])
-df["tw_time"] = pd.to_datetime(df["tw_time"])
-df["forecast_time"] = pd.to_datetime(df["forecast_time"])
-df["target_time"] = pd.to_datetime(df["target_time"])
+if TRAINING_MODE == "operational":
+    # Load in-sample predictions for training
+    df_train = pd.read_csv(TWILIGHT_OFFSET_INSAMPLE_FILE)
+    df_train["tw_date"] = pd.to_datetime(df_train["tw_date"])
+    df_train["tw_time"] = pd.to_datetime(df_train["tw_time"])
+    df_train["forecast_time"] = pd.to_datetime(df_train["forecast_time"])
+    df_train["target_time"] = pd.to_datetime(df_train["target_time"])
+    print(f"  Training data (in-sample): {len(df_train)} rows, {df_train['tw_time'].nunique()} twilights")
 
-print(f"  twilight_offset rows: {len(df)}")
+    # Load 2025 test predictions for testing
+    df_test = pd.read_csv(TWILIGHT_OFFSET_FILE)
+    df_test["tw_date"] = pd.to_datetime(df_test["tw_date"])
+    df_test["tw_time"] = pd.to_datetime(df_test["tw_time"])
+    df_test["forecast_time"] = pd.to_datetime(df_test["forecast_time"])
+    df_test["target_time"] = pd.to_datetime(df_test["target_time"])
+    print(f"  Test data (2025): {len(df_test)} rows, {df_test['tw_time'].nunique()} twilights")
+
+    # Combine for feature engineering (but track source)
+    df_train["_is_train"] = True
+    df_test["_is_train"] = False
+    df = pd.concat([df_train, df_test], ignore_index=True)
+else:
+    # Paper mode: load single file, split by odd/even days
+    df = pd.read_csv(TWILIGHT_OFFSET)
+    df["tw_date"] = pd.to_datetime(df["tw_date"])
+    df["tw_time"] = pd.to_datetime(df["tw_time"])
+    df["forecast_time"] = pd.to_datetime(df["forecast_time"])
+    df["target_time"] = pd.to_datetime(df["target_time"])
+    df["_is_train"] = None  # Will be determined by day_num later
+
+print(f"  Total twilight_offset rows: {len(df)}")
 print(f"  Twilight events: {df['tw_time'].nunique()}")
 print(f"  pred_time values: {df['pred_time'].unique()}")
 
@@ -161,6 +345,11 @@ print(f"  temp_since_sunrise: warming since sunrise (mean={df['temp_since_sunris
 # 3. rate_midday_to_twilight is already in data (r=0.40)
 print(f"  rate_midday_to_twilight: afternoon rate (mean={df['rate_midday_to_twilight'].mean():.2f}°C/h)")
 
+# 4. Seasonal interaction features (reduce seasonal bias)
+df["rate_tw_mid_x_doy_cos"] = df["rate_twilight_to_midnight"] * df["doy_cos"]
+df["rate_mid_tw_x_doy_cos"] = df["rate_midday_to_twilight"] * df["doy_cos"]
+print(f"  rate_tw_mid_x_doy_cos, rate_mid_tw_x_doy_cos: seasonal interaction features")
+
 # =============================================================================
 # 3. Define feature columns (20 features, optimized Jan 2026)
 # =============================================================================
@@ -184,9 +373,12 @@ feature_cols = [
     "twilight_cos",
     "doy_sin",
     "doy_cos",
+    # Seasonal interaction features (reduce seasonal bias)
+    "rate_tw_mid_x_doy_cos",
+    "rate_mid_tw_x_doy_cos",
     # Temperature trend
     "trend_temp_3d",
-]  # 24 features total
+]  # 26 features total
 
 target_col = "tw_slope"
 print(f"\n[3] Feature set: {len(feature_cols)} features")
@@ -211,8 +403,16 @@ df_recent["pred_horizon"] = (df_recent["target_time"] - df_recent["forecast_time
 df_recent = df_recent[df_recent["pred_horizon"] <= MAX_PREDICTION_HORIZON].copy()
 
 df_3h = df_recent.dropna(subset=feature_cols + [target_col, "tw_temp"])
-train_3h = df_3h[df_3h["day_num"] % 2 == 1]
-test_3h = df_3h[df_3h["day_num"] % 2 == 0]
+
+# Train/test split based on training mode
+if TRAINING_MODE == "operational":
+    # Operational: train on in-sample data, test on 2025 data
+    train_3h = df_3h[df_3h["_is_train"] == True]
+    test_3h = df_3h[df_3h["_is_train"] == False]
+else:
+    # Paper mode: odd days for training, even days for testing
+    train_3h = df_3h[df_3h["day_num"] % 2 == 1]
+    test_3h = df_3h[df_3h["day_num"] % 2 == 0]
 
 print(f"  Training samples: {len(train_3h)}, Test samples: {len(test_3h)}")
 
@@ -235,6 +435,33 @@ predictions_3h = dict(zip(test_3h["tw_time"], pred_tw_temp_3h))
 
 # Also predict slopes for train set (for next iteration)
 pred_slope_train_3h = model.predict(X_train_3h)
+
+# Store 3h predictions for reuse
+predictions_3h = dict(zip(test_3h["tw_time"], pred_tw_temp_3h))
+
+# Seasonal bias analysis (interaction features reduce bias)
+def get_season(month):
+    if month in [12, 1, 2]:
+        return "Summer"
+    elif month in [3, 4, 5]:
+        return "Fall"
+    elif month in [6, 7, 8]:
+        return "Winter"
+    else:
+        return "Spring"
+
+test_3h = test_3h.copy()
+test_3h["month"] = test_3h["tw_time"].dt.month
+test_3h["season"] = test_3h["month"].apply(get_season)
+
+seasonal_bias = {}
+print("\n  Seasonal bias (3h lead):")
+for season in ["Summer", "Fall", "Winter", "Spring"]:
+    mask = test_3h["season"] == season
+    if mask.any():
+        bias = error_3h[mask.values].mean()
+        seasonal_bias[season] = bias
+        print(f"    {season}: {bias:+.3f}°C (n={mask.sum()})")
 
 # Save ALL slope predictions (train + test) for iterative refinement
 slope_predictions = []
@@ -311,8 +538,14 @@ for lead_time in LEAD_TIMES:
             continue
 
         df_lt = df_recent.dropna(subset=feature_cols + [target_col, "tw_temp"])
-        train = df_lt[df_lt["day_num"] % 2 == 1]
-        test = df_lt[df_lt["day_num"] % 2 == 0]
+
+        # Train/test split based on training mode
+        if TRAINING_MODE == "operational":
+            train = df_lt[df_lt["_is_train"] == True]
+            test = df_lt[df_lt["_is_train"] == False]
+        else:
+            train = df_lt[df_lt["day_num"] % 2 == 1]
+            test = df_lt[df_lt["day_num"] % 2 == 0]
 
         if len(train) < 10 or len(test) < 10:
             print(f"{lead_time:>5.1f}h: skipping (train={len(train)}, test={len(test)})")
@@ -335,7 +568,6 @@ for lead_time in LEAD_TIMES:
 
         print(f"{lead_time:>5.1f}h {'trained':>12} {len(test):>8} {rmse_ridge:>9.3f}°C")
 
-
         for i, (_, row) in enumerate(test.iterrows()):
             all_ridge_rows.append({
                 "twilight_time": row["tw_time"],
@@ -351,6 +583,8 @@ print("-" * 85)
 ridge_df = pd.DataFrame(all_ridge_rows)
 print(f"  Total NBEATSx-Ridge rows: {len(ridge_df)}")
 
+ridge_df["twilight_time"] = pd.to_datetime(ridge_df["twilight_time"])
+
 # =============================================================================
 # Save slopes at 10am LOCAL TIME (for iterative correction)
 # =============================================================================
@@ -362,8 +596,13 @@ df_10am = df[(df["target_hour"] >= 9) & (df["target_hour"] <= 10)].copy()
 df_10am = df_10am.groupby("tw_time").last().reset_index()
 df_10am = df_10am.dropna(subset=feature_cols + [target_col, "tw_temp"])
 
-train_10am = df_10am[df_10am["day_num"] % 2 == 1]
-test_10am = df_10am[df_10am["day_num"] % 2 == 0]
+# Train/test split based on training mode
+if TRAINING_MODE == "operational":
+    train_10am = df_10am[df_10am["_is_train"] == True]
+    test_10am = df_10am[df_10am["_is_train"] == False]
+else:
+    train_10am = df_10am[df_10am["day_num"] % 2 == 1]
+    test_10am = df_10am[df_10am["day_num"] % 2 == 0]
 
 if len(train_10am) >= 10 and len(test_10am) >= 10:
     scaler_10am = StandardScaler()
@@ -406,12 +645,34 @@ else:
 print("\n[5] Creating paper_results_v2.csv...")
 
 paper_results_v2 = paper_results.copy()
+# Rename Oracle models (use hyphen, not underscore)
 paper_results_v2["model"] = paper_results_v2["model"].replace(
-    "NBEATSx_Oracle", "NBEATSx"
+    "NBEATSx-Oracle", "NBEATSx-Oracle"  # Keep as-is
 )
-paper_results_v2["model"] = paper_results_v2["model"].replace("NHITS_Oracle", "NHITS")
 
+# Add NBEATSx-Ridge predictions
 paper_results_v2 = pd.concat([paper_results_v2, ridge_df], ignore_index=True)
+
+# =============================================================================
+# Add External Forecasts (Prophet, MeteoBlue)
+# =============================================================================
+print("\n[6] Adding external forecasts...")
+
+# Get twilight events for external forecast matching
+twilight_events = paper_results_v2[["twilight_time", "actual_temp"]].drop_duplicates()
+
+# Process Prophet forecasts
+prophet_df = process_prophet_forecasts(twilight_events)
+if len(prophet_df) > 0:
+    paper_results_v2 = pd.concat([paper_results_v2, prophet_df], ignore_index=True)
+
+# Process MeteoBlue forecasts
+meteoblue_df = process_meteoblue_forecasts(twilight_events)
+if len(meteoblue_df) > 0:
+    paper_results_v2 = pd.concat([paper_results_v2, meteoblue_df], ignore_index=True)
+
+# Save final results
+OUTPUT_PATH = RESULTS_PATH / "paper_results_final.csv"
 paper_results_v2.to_csv(OUTPUT_PATH, index=False)
 print(f"  Saved to: {OUTPUT_PATH}")
 
@@ -429,11 +690,12 @@ for model in [
     "Persistence",
     "Persistence-Twilight",
     "Linear",
-    "NHITS",
     "RandomForest",
     "MLP",
-    "NBEATSx",
+    "NBEATSx-Oracle",
     "NBEATSx-Ridge",
+    "Prophet",
+    "MeteoBlue",
 ]:
     data = at_3h[at_3h["model"] == model]
     if len(data) > 0:

@@ -90,6 +90,7 @@ from config import (
     NBEATS_HORIZON,
     NBEATS_INPUT_SIZE,
     NBEATS_MAX_STEPS,
+    NBEATS_CONFIG,
     NBEATS_HIST_EXOG,
     NBEATS_FUTR_EXOG,
     PRED_TIMES,
@@ -97,6 +98,8 @@ from config import (
     MLP_CONFIG,
     RIDGE_ALPHA,
     SLOPE_FILE,
+    TRAINING_MODE,
+    TWILIGHT_OFFSET_INSAMPLE_FILE,
 )
 
 def get_twilight_events(df: pd.DataFrame) -> pd.DataFrame:
@@ -347,9 +350,9 @@ def train_nbeats_model(
     use_cache: bool = True,
 ):
     """Train NBEATSx model on delta_T target with 12h horizon."""
-    # Cache path - v1 suffix indicates optimized features
+    # Cache path - v2 suffix indicates 4-stack architecture
     cutoff_str = cutoff_time.strftime("%Y%m%d")
-    cache_path = NBEATS_CACHE_PATH / f"NBEATSx_deltaT_v1_{cutoff_str}"
+    cache_path = NBEATS_CACHE_PATH / f"NBEATSx_deltaT_v2_{cutoff_str}"
 
     if use_cache and cache_path.exists():
         print(f"  Loading cached model from {cache_path.name}")
@@ -382,15 +385,10 @@ def train_nbeats_model(
         max_steps=NBEATS_MAX_STEPS,
         hist_exog_list=hist_exog,
         futr_exog_list=futr_exog,
-        activation="SELU",
         loss=HuberLoss(),
-        learning_rate=0.01,
-        scaler_type="robust",
         enable_progress_bar=False,
         enable_model_summary=False,
-        stack_types=["trend", "seasonality", "exogenous"],
-        mlp_units=3 * [[32, 32]],
-        n_blocks=[1, 1, 1],
+        **NBEATS_CONFIG,
     )
 
     with suppress_stdout():
@@ -710,7 +708,24 @@ def main():
 
         print(f"  Paper requests: {len(paper_requests)}")
         print("Running paper_results predictions...")
-        paper_preds = predict_batch(nbeats_delta_model, df_delta, paper_requests)
+
+        # Process in batches of 1000 requests
+        BATCH_SIZE = 1000
+        paper_preds = {}
+        for batch_start in range(0, len(paper_requests), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(paper_requests))
+            batch_requests = paper_requests[batch_start:batch_end]
+            batch_metadata = paper_metadata[batch_start:batch_end]
+
+            # Create index mapping for this batch
+            batch_preds = predict_batch(nbeats_delta_model, df_delta, batch_requests)
+
+            # Remap indices to global indices
+            for local_idx, result in batch_preds.items():
+                global_idx = batch_start + local_idx
+                paper_preds[global_idx] = result
+
+            print(f"    Batch {batch_start//BATCH_SIZE + 1}/{(len(paper_requests) + BATCH_SIZE - 1)//BATCH_SIZE}: {len(batch_preds)} predictions")
 
         for req_idx, result in paper_preds.items():
             meta = paper_metadata[req_idx]
@@ -794,74 +809,282 @@ def main():
 
         print(f"  Offset requests: {len(offset_requests)}")
         print("Running offset_predictions...")
-        offset_preds = predict_batch(nbeats_delta_model, df_delta, offset_requests)
+
+        # Process in batches of 1000 requests
+        offset_preds = {}
+        for batch_start in range(0, len(offset_requests), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(offset_requests))
+            batch_requests = offset_requests[batch_start:batch_end]
+
+            batch_preds = predict_batch(nbeats_delta_model, df_delta, batch_requests)
+
+            # Remap indices to global indices
+            for local_idx, result in batch_preds.items():
+                global_idx = batch_start + local_idx
+                offset_preds[global_idx] = result
+
+            print(f"    Batch {batch_start//BATCH_SIZE + 1}/{(len(offset_requests) + BATCH_SIZE - 1)//BATCH_SIZE}: {len(batch_preds)} predictions")
+
+        # Pre-compute index lookup (15-min regular spacing)
+        df_delta_sorted = df_delta.sort_values("ds").reset_index(drop=True)
+        t0 = df_delta_sorted["ds"].iloc[0]
+        t0_ts = t0.timestamp()
+        FREQ_SECS = 15 * 60
+
+        # Pre-extract columns as numpy arrays for fast indexing
+        y_arr = df_delta_sorted["y"].values
+        trend_3d_arr = df_delta_sorted["temp_trend_3d"].values
+        trend_2h_arr = df_delta_sorted["trend_2h"].values
+        rate_sr_mid_arr = df_delta_sorted["rate_sunrise_to_midday"].values
+        rate_mid_tw_arr = df_delta_sorted["rate_midday_to_twilight"].values
+        rate_tw_mid_arr = df_delta_sorted["rate_twilight_to_midnight"].values
+        rate_mid_sr_arr = df_delta_sorted["rate_midnight_to_sunrise"].values
+        n_rows = len(df_delta_sorted)
+
+        print("  Processing offset predictions (vectorized)...")
+
+        # Collect all predictions into lists for vectorized processing
+        all_req_idx = []
+        all_target_times = []
+        all_delta_T_pred = []
 
         for req_idx, result in offset_preds.items():
-            meta = offset_metadata[req_idx]
-            tw_time = meta["tw_time"]
-            tw_temp = meta["tw_temp"]
-            T_tw_last = meta["T_tw_last"]
-            prev_tw_time = meta["prev_tw_time"]
-            forecast_time = meta["forecast_time"]
-            pred_time = meta["pred_time"]
-            temp_last_sunrise = meta["temp_last_sunrise"]
-
             pred_df = result["predictions"]
+            n_preds = len(pred_df)
+            all_req_idx.extend([req_idx] * n_preds)
+            all_target_times.extend(pred_df["ds"].tolist())
+            all_delta_T_pred.extend(pred_df["delta_T_pred"].tolist())
 
-            for _, pred_row in pred_df.iterrows():
-                target_time = pred_row["ds"]
-                delta_T_pred = pred_row["delta_T_pred"]
+        # Convert to numpy arrays
+        all_req_idx = np.array(all_req_idx)
+        all_target_times = np.array(all_target_times)
+        all_delta_T_pred = np.array(all_delta_T_pred)
 
-                actual_row = df_delta[df_delta["ds"] == target_time]
-                if len(actual_row) == 0:
-                    continue
+        # Vectorized index calculation
+        target_timestamps = np.array([t.timestamp() for t in all_target_times])
+        all_idx = ((target_timestamps - t0_ts) // FREQ_SECS).astype(int)
 
-                actual_temp = actual_row["y"].values[0]
-                h_from_tw = (target_time - prev_tw_time).total_seconds() / 3600
-                hour_to_tw = (target_time - tw_time).total_seconds() / 3600
-                temp_approx = delta_T_pred + T_tw_last
-                res_tw = actual_temp - temp_approx
-                trend_temp_3d = actual_row["temp_trend_3d"].values[0] if "temp_trend_3d" in actual_row.columns else np.nan
+        # Filter valid indices
+        valid_mask = (all_idx >= 0) & (all_idx < n_rows)
+        all_req_idx = all_req_idx[valid_mask]
+        all_target_times = all_target_times[valid_mask]
+        all_delta_T_pred = all_delta_T_pred[valid_mask]
+        all_idx = all_idx[valid_mask]
 
-                # Extract rate features for Ridge correction
-                rate_sunrise_to_midday = actual_row["rate_sunrise_to_midday"].values[0] if "rate_sunrise_to_midday" in actual_row.columns else np.nan
-                rate_midday_to_twilight = actual_row["rate_midday_to_twilight"].values[0] if "rate_midday_to_twilight" in actual_row.columns else np.nan
-                rate_twilight_to_midnight = actual_row["rate_twilight_to_midnight"].values[0] if "rate_twilight_to_midnight" in actual_row.columns else np.nan
-                rate_midnight_to_sunrise = actual_row["rate_midnight_to_sunrise"].values[0] if "rate_midnight_to_sunrise" in actual_row.columns else np.nan
-                trend_2h = actual_row["trend_2h"].values[0] if "trend_2h" in actual_row.columns else np.nan
+        # Vectorized lookups
+        all_actual_temp = y_arr[all_idx]
+        all_trend_3d = trend_3d_arr[all_idx]
+        all_trend_2h = trend_2h_arr[all_idx]
+        all_rate_sr_mid = rate_sr_mid_arr[all_idx]
+        all_rate_mid_tw = rate_mid_tw_arr[all_idx]
+        all_rate_tw_mid = rate_tw_mid_arr[all_idx]
+        all_rate_mid_sr = rate_mid_sr_arr[all_idx]
 
-                offset_predictions.append({
-                    "tw_date": tw_time.date(),
-                    "tw_time": tw_time,
-                    "tw_temp": tw_temp,
-                    "T_tw_last": T_tw_last,
-                    "pred_time": pred_time,
-                    "forecast_time": forecast_time,
-                    "target_time": target_time,
-                    "h_from_tw": h_from_tw,
-                    "hour_to_tw": hour_to_tw,
-                    "temp_actual": actual_temp,
-                    "temp_approx": temp_approx,
-                    "delta_T_pred": delta_T_pred,
-                    "res_tw": res_tw,
-                    "temp_last_sunrise": temp_last_sunrise,
-                    "trend_temp_3d": trend_temp_3d,
-                    "trend_2h": trend_2h,
-                    "rate_sunrise_to_midday": rate_sunrise_to_midday,
-                    "rate_midday_to_twilight": rate_midday_to_twilight,
-                    "rate_twilight_to_midnight": rate_twilight_to_midnight,
-                    "rate_midnight_to_sunrise": rate_midnight_to_sunrise,
-                })
+        # Extract metadata arrays
+        all_tw_time = np.array([offset_metadata[i]["tw_time"] for i in all_req_idx])
+        all_tw_temp = np.array([offset_metadata[i]["tw_temp"] for i in all_req_idx])
+        all_T_tw_last = np.array([offset_metadata[i]["T_tw_last"] for i in all_req_idx])
+        all_prev_tw_time = np.array([offset_metadata[i]["prev_tw_time"] for i in all_req_idx])
+        all_forecast_time = np.array([offset_metadata[i]["forecast_time"] for i in all_req_idx])
+        all_pred_time = np.array([offset_metadata[i]["pred_time"] for i in all_req_idx])
+        all_temp_last_sunrise = np.array([offset_metadata[i]["temp_last_sunrise"] for i in all_req_idx])
+
+        # Vectorized calculations
+        all_temp_approx = all_delta_T_pred + all_T_tw_last
+        all_res_tw = all_actual_temp - all_temp_approx
+
+        # Time calculations (vectorized)
+        target_ts = np.array([t.timestamp() for t in all_target_times])
+        prev_tw_ts = np.array([t.timestamp() for t in all_prev_tw_time])
+        tw_ts = np.array([t.timestamp() for t in all_tw_time])
+        all_h_from_tw = (target_ts - prev_tw_ts) / 3600
+        all_hour_to_tw = (target_ts - tw_ts) / 3600
+
+        # Build DataFrame directly (much faster than list of dicts)
+        offset_df = pd.DataFrame({
+            "tw_date": [t.date() for t in all_tw_time],
+            "tw_time": all_tw_time,
+            "tw_temp": all_tw_temp,
+            "T_tw_last": all_T_tw_last,
+            "pred_time": all_pred_time,
+            "forecast_time": all_forecast_time,
+            "target_time": all_target_times,
+            "h_from_tw": all_h_from_tw,
+            "hour_to_tw": all_hour_to_tw,
+            "temp_actual": all_actual_temp,
+            "temp_approx": all_temp_approx,
+            "delta_T_pred": all_delta_T_pred,
+            "res_tw": all_res_tw,
+            "temp_last_sunrise": all_temp_last_sunrise,
+            "trend_temp_3d": all_trend_3d,
+            "trend_2h": all_trend_2h,
+            "rate_sunrise_to_midday": all_rate_sr_mid,
+            "rate_midday_to_twilight": all_rate_mid_tw,
+            "rate_twilight_to_midnight": all_rate_tw_mid,
+            "rate_midnight_to_sunrise": all_rate_mid_sr,
+        })
 
         # Save twilight_offset_predictions.csv (or _iter1.csv if using slope correction)
-        if offset_predictions:
-            offset_df = pd.DataFrame(offset_predictions)
+        if len(offset_df) > 0:
             if SLOPE_FILE is not None:
                 offset_file = RESULTS_PATH / "twilight_offset_predictions_iter1.csv"
             else:
                 offset_file = RESULTS_PATH / "twilight_offset_predictions.csv"
             offset_df.to_csv(offset_file, index=False)
             print(f"\n  Saved {len(offset_df)} rows to {offset_file.name}")
+
+        # =====================================================================
+        # PART 3: Generate in-sample predictions for operational mode
+        # =====================================================================
+        if TRAINING_MODE == "operational":
+            print(f"\n[OPERATIONAL MODE] Generating in-sample predictions...")
+
+            # Get TRAINING twilights (pre-2025)
+            tw_train = df_delta[df_delta["twilight_temp"].notna()].copy()
+            tw_train = tw_train[tw_train["ds"] < TEST_START_DATE]
+
+            # Add previous twilight info
+            tw_train["T_tw_prev"] = tw_train["twilight_temp"].shift(1)
+            tw_train["prev_tw_time"] = tw_train["ds"].shift(1)
+
+            print(f"  Training twilight events: {len(tw_train)}")
+
+            # Collect in-sample requests (same structure as offset predictions)
+            insample_requests = []
+            insample_metadata = []
+
+            for _, tw_row in tw_train.iterrows():
+                tw_time = tw_row["ds"]
+                tw_temp = tw_row["twilight_temp"]
+                T_tw_prev = tw_row["T_tw_prev"]
+                prev_tw_time = tw_row["prev_tw_time"]
+                last_tw_time = tw_row["last_tw_time"]
+                temp_last_sunrise = tw_row.get("temp_last_sunrise", np.nan)
+
+                if pd.isna(T_tw_prev):
+                    continue
+
+                for pred_name, hours_before in PRED_TIMES:
+                    forecast_time = tw_time - pd.Timedelta(hours=hours_before)
+                    if forecast_time < df_delta["ds"].min() + pd.Timedelta(days=1):
+                        continue
+
+                    insample_requests.append({
+                        "tw_time": tw_time,
+                        "forecast_time": forecast_time,
+                        "last_tw_time": last_tw_time,
+                    })
+                    insample_metadata.append({
+                        "tw_time": tw_time,
+                        "tw_temp": tw_temp,
+                        "T_tw_last": T_tw_prev,
+                        "prev_tw_time": prev_tw_time,
+                        "forecast_time": forecast_time,
+                        "temp_last_sunrise": temp_last_sunrise,
+                        "pred_time": pred_name,
+                    })
+
+            print(f"  In-sample requests: {len(insample_requests)}")
+            print("  Running in-sample predictions...")
+
+            # Process in batches
+            insample_preds = {}
+            for batch_start in range(0, len(insample_requests), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, len(insample_requests))
+                batch_requests = insample_requests[batch_start:batch_end]
+
+                batch_preds = predict_batch(nbeats_delta_model, df_delta, batch_requests)
+
+                for local_idx, result in batch_preds.items():
+                    global_idx = batch_start + local_idx
+                    insample_preds[global_idx] = result
+
+                print(f"    Batch {batch_start//BATCH_SIZE + 1}/{(len(insample_requests) + BATCH_SIZE - 1)//BATCH_SIZE}: {len(batch_preds)} predictions")
+
+            # Vectorized processing (same as test predictions)
+            print("  Processing in-sample predictions (vectorized)...")
+
+            all_req_idx_is = []
+            all_target_times_is = []
+            all_delta_T_pred_is = []
+
+            for req_idx, result in insample_preds.items():
+                pred_df = result["predictions"]
+                n_preds = len(pred_df)
+                all_req_idx_is.extend([req_idx] * n_preds)
+                all_target_times_is.extend(pred_df["ds"].tolist())
+                all_delta_T_pred_is.extend(pred_df["delta_T_pred"].tolist())
+
+            all_req_idx_is = np.array(all_req_idx_is)
+            all_target_times_is = np.array(all_target_times_is)
+            all_delta_T_pred_is = np.array(all_delta_T_pred_is)
+
+            target_timestamps_is = np.array([t.timestamp() for t in all_target_times_is])
+            all_idx_is = ((target_timestamps_is - t0_ts) // FREQ_SECS).astype(int)
+
+            valid_mask_is = (all_idx_is >= 0) & (all_idx_is < n_rows)
+            all_req_idx_is = all_req_idx_is[valid_mask_is]
+            all_target_times_is = all_target_times_is[valid_mask_is]
+            all_delta_T_pred_is = all_delta_T_pred_is[valid_mask_is]
+            all_idx_is = all_idx_is[valid_mask_is]
+
+            # Vectorized lookups
+            all_actual_temp_is = y_arr[all_idx_is]
+            all_trend_3d_is = trend_3d_arr[all_idx_is]
+            all_trend_2h_is = trend_2h_arr[all_idx_is]
+            all_rate_sr_mid_is = rate_sr_mid_arr[all_idx_is]
+            all_rate_mid_tw_is = rate_mid_tw_arr[all_idx_is]
+            all_rate_tw_mid_is = rate_tw_mid_arr[all_idx_is]
+            all_rate_mid_sr_is = rate_mid_sr_arr[all_idx_is]
+
+            # Extract metadata arrays
+            all_tw_time_is = np.array([insample_metadata[i]["tw_time"] for i in all_req_idx_is])
+            all_tw_temp_is = np.array([insample_metadata[i]["tw_temp"] for i in all_req_idx_is])
+            all_T_tw_last_is = np.array([insample_metadata[i]["T_tw_last"] for i in all_req_idx_is])
+            all_prev_tw_time_is = np.array([insample_metadata[i]["prev_tw_time"] for i in all_req_idx_is])
+            all_forecast_time_is = np.array([insample_metadata[i]["forecast_time"] for i in all_req_idx_is])
+            all_pred_time_is = np.array([insample_metadata[i]["pred_time"] for i in all_req_idx_is])
+            all_temp_last_sunrise_is = np.array([insample_metadata[i]["temp_last_sunrise"] for i in all_req_idx_is])
+
+            # Vectorized calculations
+            all_temp_approx_is = all_delta_T_pred_is + all_T_tw_last_is
+            all_res_tw_is = all_actual_temp_is - all_temp_approx_is
+
+            # Time calculations
+            target_ts_is = np.array([t.timestamp() for t in all_target_times_is])
+            prev_tw_ts_is = np.array([t.timestamp() for t in all_prev_tw_time_is])
+            tw_ts_is = np.array([t.timestamp() for t in all_tw_time_is])
+            all_h_from_tw_is = (target_ts_is - prev_tw_ts_is) / 3600
+            all_hour_to_tw_is = (target_ts_is - tw_ts_is) / 3600
+
+            # Build DataFrame
+            insample_df = pd.DataFrame({
+                "tw_date": [t.date() for t in all_tw_time_is],
+                "tw_time": all_tw_time_is,
+                "tw_temp": all_tw_temp_is,
+                "T_tw_last": all_T_tw_last_is,
+                "pred_time": all_pred_time_is,
+                "forecast_time": all_forecast_time_is,
+                "target_time": all_target_times_is,
+                "h_from_tw": all_h_from_tw_is,
+                "hour_to_tw": all_hour_to_tw_is,
+                "temp_actual": all_actual_temp_is,
+                "temp_approx": all_temp_approx_is,
+                "delta_T_pred": all_delta_T_pred_is,
+                "res_tw": all_res_tw_is,
+                "temp_last_sunrise": all_temp_last_sunrise_is,
+                "trend_temp_3d": all_trend_3d_is,
+                "trend_2h": all_trend_2h_is,
+                "rate_sunrise_to_midday": all_rate_sr_mid_is,
+                "rate_midday_to_twilight": all_rate_mid_tw_is,
+                "rate_twilight_to_midnight": all_rate_tw_mid_is,
+                "rate_midnight_to_sunrise": all_rate_mid_sr_is,
+            })
+
+            # Save in-sample predictions
+            if len(insample_df) > 0:
+                insample_df.to_csv(TWILIGHT_OFFSET_INSAMPLE_FILE, index=False)
+                print(f"\n  Saved {len(insample_df)} in-sample rows to {TWILIGHT_OFFSET_INSAMPLE_FILE.name}")
 
         del nbeats_delta_model
         gc.collect()

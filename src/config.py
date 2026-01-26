@@ -27,15 +27,16 @@ TWILIGHT_OFFSET_CACHE = RESULTS_PATH / "twilight_offset_cache"
 PAPER_RESULTS_FILE = RESULTS_PATH / "paper_results.csv"
 PAPER_RESULTS_V2_FILE = RESULTS_PATH / "paper_results_v2.csv"
 TWILIGHT_OFFSET_FILE = RESULTS_PATH / "twilight_offset_predictions.csv"
+TWILIGHT_OFFSET_INSAMPLE_FILE = RESULTS_PATH / "twilight_offset_predictions_insample.csv"
 METRICS_3H_FILE = RESULTS_PATH / "metrics_3h.csv"
 FIGURES_PATH = ROOT_PATH / "figures"
 
 # Iterative slope correction
 # Set to None for flat baseline (iteration 0), or path to slope CSV for iterations 1+
-SLOPE_FILE = (
-    RESULTS_PATH / "slope_predictions_10am.csv"
-)  # Iteration 1: use slope_v1 from 10am
-# SLOPE_FILE = None  # iteration 0
+# SLOPE_FILE = (
+#     RESULTS_PATH / "slope_predictions_10am.csv"
+# )  # Iteration 1: use slope_v1 from 10am
+SLOPE_FILE = None  # iteration 0
 
 # =============================================================================
 # Time Series Configuration
@@ -49,6 +50,15 @@ SAMPLES_PER_HOUR = 4
 # =============================================================================
 
 TEST_START_DATE = pd.Timestamp("2025-01-01")
+
+# =============================================================================
+# Training Mode
+# =============================================================================
+
+# Training mode for Ridge correction:
+# - "paper": Train Ridge on odd days of 2025 test data (original paper approach)
+# - "operational": Train Ridge on in-sample NBEATSx predictions (pre-2025 data)
+TRAINING_MODE = "operational"
 
 # =============================================================================
 # Lead Times for Evaluation
@@ -77,13 +87,13 @@ NBEATS_HORIZON = 48  # 12 hours at 15-min resolution
 NBEATS_INPUT_SIZE = 96  # 24 hours at 15-min resolution
 NBEATS_MAX_STEPS = 500
 
-# Architecture
+# Architecture (4-stack: 6.3% better than 3-stack)
 NBEATS_CONFIG = {
     "activation": "SELU",
     "scaler_type": "robust",
-    "stack_types": ["trend", "seasonality", "exogenous"],
-    "mlp_units": 3 * [[32, 32]],
-    "n_blocks": [1, 1, 1],
+    "stack_types": ["trend", "seasonality", "identity", "exogenous"],
+    "mlp_units": 4 * [[32, 32]],
+    "n_blocks": [1, 1, 1, 1],
     "learning_rate": 0.01,
 }
 

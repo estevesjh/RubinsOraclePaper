@@ -1,6 +1,6 @@
 """Generate figures for the twilight forecasting paper.
 
-Includes NBEATSx-Ridge model from paper_results_v2.csv.
+Includes NBEATSx-Ridge model from paper_results_final.csv.
 
 Figures (matching main.tex):
 - Fig 0: Dataset overview (full year + representative week)
@@ -46,11 +46,11 @@ MODEL_ORDER = [
 
 
 def load_results() -> pd.DataFrame:
-    """Load paper results v2."""
-    results_file = RESULTS_PATH / "paper_results_v2.csv"
+    """Load paper results final."""
+    results_file = RESULTS_PATH / "paper_results_final.csv"
     df = pd.read_csv(results_file)
-    df["twilight_time"] = pd.to_datetime(df["twilight_time"])
-    df["forecast_time"] = pd.to_datetime(df["forecast_time"])
+    df["twilight_time"] = pd.to_datetime(df["twilight_time"], format="mixed")
+    df["forecast_time"] = pd.to_datetime(df["forecast_time"], format="mixed")
     df["abs_error"] = np.abs(df["error"])
     return df
 
@@ -91,16 +91,24 @@ def fig0_dataset_overview():
             twilight_temps,
         )
 
-        # 5. Find representative 5-day window with median variance in twilight slope
+        # 5. Find representative 5-day window in LATE SUMMER (late Feb - early March)
         tw_df = df[twilight_mask].copy().reset_index(drop=True)
         tw_df["slope_to_next"] = tw_df["twilight_temp"].diff(1).shift(-1) / (
             tw_df["ds_local"].diff(1).shift(-1).dt.total_seconds() / 3600
         )
         # Compute rolling 5-day variance (5 twilights)
         tw_df["rolling_var"] = tw_df["slope_to_next"].rolling(5, center=True).var()
-        median_var = tw_df["rolling_var"].median()
-        # Find twilight closest to median variance
-        center_idx = (tw_df["rolling_var"] - median_var).abs().idxmin()
+
+        # Filter to late summer (late February and March)
+        tw_df["month"] = tw_df["ds_local"].dt.month
+        tw_df["day"] = tw_df["ds_local"].dt.day
+        late_summer_tw = tw_df[
+            ((tw_df["month"] == 2) & (tw_df["day"] >= 20)) | (tw_df["month"] == 3)
+        ].copy()
+
+        # Find twilight with median variance within late summer
+        median_var = late_summer_tw["rolling_var"].median()
+        center_idx = (late_summer_tw["rolling_var"] - median_var).abs().idxmin()
         center_twilight = tw_df.loc[center_idx, "ds_local"]
 
         # Get 5-day window centered on this twilight
@@ -123,9 +131,14 @@ def fig0_dataset_overview():
             & sunrise_mask
         ]["ds_local"].values
 
-        # 7. Load NBEATSx-Ridge forecasts at 6h lead time for all twilights in window
-        forecast_df = pd.read_csv(RESULTS_PATH / "paper_results_v2.csv")
-        forecast_df["twilight_time"] = pd.to_datetime(forecast_df["twilight_time"])
+        # 7. Load NBEATSx-Ridge forecasts at 9am local time for all twilights in window
+        forecast_df = pd.read_csv(RESULTS_PATH / "paper_results_final.csv")
+        forecast_df["twilight_time"] = pd.to_datetime(
+            forecast_df["twilight_time"], format="mixed"
+        )
+        forecast_df["forecast_time"] = pd.to_datetime(
+            forecast_df["forecast_time"], format="mixed"
+        )
         # Convert to Chile local time
         forecast_df["twilight_local"] = (
             forecast_df["twilight_time"]
@@ -133,86 +146,154 @@ def fig0_dataset_overview():
             .dt.tz_convert("America/Santiago")
             .dt.tz_localize(None)
         )
+        forecast_df["forecast_local"] = (
+            forecast_df["forecast_time"]
+            .dt.tz_localize("UTC")
+            .dt.tz_convert("America/Santiago")
+            .dt.tz_localize(None)
+        )
+        forecast_df["forecast_local_hour"] = forecast_df["forecast_local"].dt.hour
 
-        # Get NBEATSx-Ridge forecasts at 12h lead time
-        ridge_12h = forecast_df[
+        # Get NBEATSx-Ridge forecasts issued at 9am local time
+        ridge_9am = forecast_df[
             (forecast_df["model"] == "NBEATSx-Ridge")
-            & (forecast_df["lead_time_hours"] == 12.0)
+            & (forecast_df["forecast_local_hour"] == 9)
         ].copy()
 
         # Match forecasts to window twilights
         forecast_points = []
         for tw_time in window_twilights:
             tw_local = pd.Timestamp(tw_time)
-            match = ridge_12h[
-                abs((ridge_12h["twilight_local"] - tw_local).dt.total_seconds()) < 3600
+            match = ridge_9am[
+                abs((ridge_9am["twilight_local"] - tw_local).dt.total_seconds()) < 3600
             ]
             if len(match) > 0:
                 forecast_points.append((tw_local, match.iloc[0]["forecast_temp"]))
 
-        # 8. Create figure with 3 rows
-        fig, axes = plt.subplots(3, 1, figsize=(14, 12), height_ratios=[1, 1, 1])
+        # 8. Create figure with 3 rows (middle and bottom share x-axis, no gap)
+        from matplotlib.gridspec import GridSpec
+
+        fig = plt.figure(figsize=(14, 11))
+        gs = GridSpec(
+            3,
+            1,
+            figure=fig,
+            height_ratios=[1, 1, 1],
+            hspace=0.25,
+            top=0.95,
+            bottom=0.08,
+        )
+        ax1 = fig.add_subplot(gs[0])
+        # Middle and bottom with shared x-axis and no gap between them
+        gs_inner = gs[1:].subgridspec(2, 1, hspace=0)
+        ax2 = fig.add_subplot(gs_inner[0])
+        ax3 = fig.add_subplot(gs_inner[1], sharex=ax2)
+        axes = [ax1, ax2, ax3]
 
         # Row 1: Full year temperature
         ax1 = axes[0]
-        ax1.plot(df["ds_local"], df["y"], color="steelblue", linewidth=0.5, alpha=0.8)
+        ax1.plot(df["ds_local"], df["y"], color="#053061", linewidth=1.0, alpha=0.8)
+        ax1.axhline(0, color="gray", linestyle="--", linewidth=1)
         ax1.set_ylabel("Temperature (°C)")
         ax1.set_title("Full Year Temperature (2025)")
         ax1.set_xlim(df["ds_local"].min(), df["ds_local"].max())
         paper_ticks(ax1)
-        # Highlight the representative window with dashed vertical lines
-        ax1.axvline(
+
+        # Highlight the representative window with shaded region + dashed outline
+        ax1.axvspan(
             window_start,
-            color="firebrick",
-            linestyle="--",
-            linewidth=1.5,
-            label="5-day window",
+            window_end,
+            color="#D3D3D3",
+            alpha=0.4,
+            zorder=0,
         )
-        ax1.axvline(window_end, color="firebrick", linestyle="--", linewidth=1.5)
-        ax1.legend(loc="upper right", fontsize=11)
+        ax1.axvline(window_start, color="#555555", linestyle="--", linewidth=1.2)
+        ax1.axvline(window_end, color="#555555", linestyle="--", linewidth=1.2)
+
+        # Add annotation for the window
+        window_center = window_start + (window_end - window_start) / 2
+        y_pos = ax1.get_ylim()[1] - 0.05 * (ax1.get_ylim()[1] - ax1.get_ylim()[0])
+        ax1.annotate(
+            "Representative\n5-day window",
+            xy=(window_center, y_pos),
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#333333",
+        )
+
+        # Format x-axis with abbreviated month names
+        from matplotlib.dates import DateFormatter, MonthLocator
+
+        ax1.xaxis.set_major_locator(MonthLocator())
+        ax1.xaxis.set_major_formatter(DateFormatter("%b"))
+        # Bold quarterly ticks (Jan, Apr, Jul, Oct)
+        for label in ax1.get_xticklabels():
+            if label.get_text() in ["Jan", "Apr", "Jul", "Oct"]:
+                label.set_fontweight("bold")
 
         # Row 2: Representative 5-day window with twilight-trend
         ax2 = axes[1]
 
         # Night bands (twilight to next sunrise)
+        first_night = True
         for tw_time in window_twilights:
             tw_time = pd.Timestamp(tw_time)
             future_sunrises = [s for s in window_sunrises if pd.Timestamp(s) > tw_time]
             if future_sunrises:
                 next_sunrise = pd.Timestamp(future_sunrises[0])
-                ax2.axvspan(tw_time, next_sunrise, color="#2c3e50", alpha=0.08)
+                label_night = "Night (twilight to sunrise)" if first_night else None
+                ax2.axvspan(
+                    tw_time,
+                    next_sunrise,
+                    color="#2c3e50",
+                    alpha=0.05,
+                    label=label_night,
+                )
+                first_night = False
 
         # Raw temperature
         ax2.plot(
             window_data["ds_local"],
             window_data["y"],
-            color="steelblue",
-            linewidth=1,
+            color="#053061",
+            linewidth=2.0,
             label="Temperature",
         )
-        # Twilight-trend baseline (dashed)
+        # Twilight-trend baseline (thicker, darker)
         ax2.plot(
             window_data["ds_local"],
             window_data["twilight_baseline"],
             color="firebrick",
-            linewidth=1.5,
+            linewidth=2.0,
             linestyle="--",
             label="Twilight-Trend",
-            alpha=0.75,
         )
-        # Twilight markers
+        # Add markers at twilight anchor points
+        window_tw_data = window_data[window_data["twilight_temp"].notna()]
+        ax2.scatter(
+            window_tw_data["ds_local"],
+            window_tw_data["twilight_temp"],
+            color="firebrick",
+            s=50,
+            zorder=5,
+            marker="s",
+            edgecolors="white",
+            linewidths=1,
+        )
+        # Twilight markers (vertical lines)
         for tw_time in window_twilights:
             ax2.axvline(
                 pd.Timestamp(tw_time),
                 color="gray",
                 linestyle="-",
-                linewidth=2,
-                alpha=0.5,
+                linewidth=1.5,
+                alpha=0.4,
             )
 
         # NBEATSx-Ridge forecast stars on all twilights
         for i, (tw_local, forecast_temp) in enumerate(forecast_points):
-            label = "NBEATSx-Ridge \n 12 forecast" if i == 0 else None
+            label = "NBEATSx-Ridge \n 9am forecast" if i == 0 else None
             ax2.plot(
                 tw_local,
                 forecast_temp,
@@ -226,18 +307,14 @@ def fig0_dataset_overview():
             )
 
         ax2.set_ylabel("Temperature (°C)")
-        ax2.set_title(
-            "Representative 5-Day Window: Raw Temperature and Twilight-Trend (Chile Local Time)"
-        )
+        ax2.set_title("Representative 5-Day Window")
         ax2.set_xlim(window_start, window_end)
         ax2.legend(loc="upper right", fontsize=11)
         paper_ticks(ax2)
 
-        # Format x-axis with date and hour (4 ticks per day = every 6 hours)
-        from matplotlib.dates import DateFormatter, HourLocator
-
-        ax2.xaxis.set_major_locator(HourLocator(byhour=[0, 12]))
-        ax2.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d\n%H:%M"))
+        # Hide x-tick labels on ax2 (shared with ax3)
+        plt.setp(ax2.get_xticklabels(), visible=False)
+        ax2.set_xlabel("")
 
         # Row 3: Offset from twilight-trend (true vs flat baseline)
         ax3 = axes[2]
@@ -246,55 +323,78 @@ def fig0_dataset_overview():
             window_data["y"] - window_data["last_twilight_temp"]
         )
 
-        # Night bands
+        # Night bands (match ax2 styling)
         for tw_time in window_twilights:
             tw_time = pd.Timestamp(tw_time)
             future_sunrises = [s for s in window_sunrises if pd.Timestamp(s) > tw_time]
             if future_sunrises:
                 next_sunrise = pd.Timestamp(future_sunrises[0])
-                ax3.axvspan(tw_time, next_sunrise, color="#2c3e50", alpha=0.08)
+                ax3.axvspan(tw_time, next_sunrise, color="#2c3e50", alpha=0.05)
 
-        # Twilight markers
+        # Twilight markers (match ax2 styling)
         for tw_time in window_twilights:
             ax3.axvline(
                 pd.Timestamp(tw_time),
                 color="gray",
                 linestyle="-",
-                linewidth=2,
-                alpha=0.5,
+                linewidth=1.5,
+                alpha=0.4,
             )
 
         # True offset (with known slope)
         ax3.plot(
             window_data["ds_local"],
             window_data["offset"],
-            color="firebrick",
-            linewidth=1,
+            color="#b2182b",
+            linewidth=2.0,
             label=r"$\Delta T$ (twilight-trend)",
         )
         # Flat baseline offset (operational mode - unknown slope)
         ax3.plot(
             window_data["ds_local"],
             window_data["offset_flat"],
-            color="black",
-            linewidth=1,
+            color="#1F1F1F",
+            linewidth=2.0,
             linestyle="--",
             alpha=0.8,
             label=r"$\Delta T$ ($T_{\mathrm{tw,last}}$)",
         )
-        ax3.axhline(0, color="black", linestyle="-", linewidth=0.5)
-        ax3.set_ylabel(r"Offset: $\Delta T$ (°C)")
+        ax3.axhline(0, color="gray", linestyle="--", linewidth=1)
+        ax3.set_ylabel("Temp - Twilight-Trend (°C)")
         ax3.set_xlabel("Date")
-        ax3.set_title("Offset from Twilight-Trend: True vs Flat Baseline (Operational)")
         ax3.set_xlim(window_start, window_end)
         ax3.legend(loc="upper right", fontsize=11)
         paper_ticks(ax3)
 
-        # Format x-axis with date and hour
-        ax3.xaxis.set_major_locator(HourLocator(byhour=[0, 12]))
-        ax3.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d\n%H:%M"))
+        # Format x-axis with date and hour (shared with ax2)
+        from matplotlib.dates import DateFormatter, HourLocator
 
-        plt.tight_layout()
+        ax3.xaxis.set_major_locator(HourLocator(byhour=[0, 12]))
+        ax3.xaxis.set_major_formatter(DateFormatter("%b %-d\n%H:%M"))
+
+        # Add Chile season markers on top plot (Southern Hemisphere)
+        seasons = [
+            ("2025-01-03", "Summer"),
+            ("2025-03-21", "Fall"),
+            ("2025-06-21", "Winter"),
+            ("2025-09-23", "Spring"),
+        ]
+        for date_str, season_name in seasons:
+            season_date = pd.Timestamp(date_str)
+            ax1.axvline(
+                season_date, color="gray", linestyle=":", linewidth=1, alpha=0.7
+            )
+            ax1.text(
+                season_date,
+                -8.5,
+                f"  {season_name}",
+                fontsize=11,
+                color="gray",
+                rotation=0,
+                verticalalignment="bottom",
+                horizontalalignment="left",
+            )
+
         plt.savefig(
             FIGURES_PATH / "fig0_dataset_overview.png", dpi=150, bbox_inches="tight"
         )
@@ -333,8 +433,8 @@ def fig2_rmse_heatmap():
 
     print("Generating Figure 2: RMSE heatmap...")
 
-    # Load paper_results_v3.csv (has Prophet data)
-    results_file = RESULTS_PATH / "paper_results_v3.csv"
+    # Load paper_results_final.csv (has Prophet data)
+    results_file = RESULTS_PATH / "paper_results_final.csv"
     df = pd.read_csv(results_file)
 
     # Define models and lead times
@@ -463,8 +563,8 @@ def fig5_cdf_absolute_error():
     plt.minorticks_on()
     sns.despine(top=False, right=False, left=False, bottom=False)
 
-    # Load paper_results_v3.csv (has Prophet data)
-    results_file = RESULTS_PATH / "paper_results_v3.csv"
+    # Load paper_results_final.csv (has Prophet data)
+    results_file = RESULTS_PATH / "paper_results_final.csv"
     results = pd.read_csv(results_file)
     results["abs_error"] = np.abs(results["error"])
     at_3h = results[np.abs(results["lead_time_hours"] - 3.0) < 0.15]
@@ -615,11 +715,13 @@ def fig6_seasonal_trend_analysis():
     # Panel 1: Error distribution by season (box plot)
     ax1 = axes[0, 0]
     season_order = ["Summer", "Fall", "Winter", "Spring"]
+    # Use RdYlBu colormap for seasons
+    cmap = plt.cm.RdYlBu
     season_colors = {
-        "Summer": "red",
-        "Fall": "orange",
-        "Winter": "blue",
-        "Spring": "green",
+        "Summer": cmap(0.1),   # Red (hot)
+        "Fall": cmap(0.35),    # Orange/Yellow
+        "Winter": cmap(0.9),   # Blue (cold)
+        "Spring": cmap(0.65),  # Light blue
     }
 
     box_data = [df[df["season"] == s]["error"].dropna().values for s in season_order]
@@ -632,16 +734,17 @@ def fig6_seasonal_trend_analysis():
     ax1.set_title("Error Distribution by Season")
     ax1.grid(True, alpha=0.3)
 
-    # Panel 2: RMS and MAE by season
+    # Panel 2: Percentage within thresholds by season
     ax2 = axes[0, 1]
     season_stats = []
     for s in season_order:
         subset = df[df["season"] == s]
+        abs_error = np.abs(subset["error"])
         season_stats.append(
             {
                 "season": s,
-                "rmse": np.sqrt((subset["error"] ** 2).mean()),
-                "mae": np.abs(subset["error"]).mean(),
+                "pct_05": (abs_error < 0.5).mean() * 100,
+                "pct_1": (abs_error < 1.0).mean() * 100,
                 "n": len(subset),
             }
         )
@@ -651,21 +754,21 @@ def fig6_seasonal_trend_analysis():
     width = 0.35
     ax2.bar(
         x - width / 2,
-        stats_df["rmse"],
+        stats_df["pct_05"],
         width,
-        label="RMSE",
+        label="< 0.5°C",
         color="steelblue",
         alpha=0.8,
     )
     ax2.bar(
-        x + width / 2, stats_df["mae"], width, label="MAE", color="coral", alpha=0.8
+        x + width / 2, stats_df["pct_1"], width, label="< 1°C", color="coral", alpha=0.8
     )
     ax2.set_xticks(x)
     ax2.set_xticklabels([f"{s}\n(n={n})" for s, n in zip(season_order, stats_df["n"])])
-    ax2.set_ylabel("Error (°C)")
-    ax2.set_title("RMS and MAE by Season")
+    ax2.set_ylabel("Percentage (%)")
+    ax2.set_title("Forecast Accuracy by Season")
     ax2.legend()
-    ax2.axhline(0.5, color="gray", linestyle="--", alpha=0.5, label="0.5°C ref")
+    ax2.set_ylim(0, 105)
     ax2.grid(True, alpha=0.3, axis="y")
 
     # Panel 3: Bias by season
@@ -679,17 +782,6 @@ def fig6_seasonal_trend_analysis():
     ax3.set_ylabel("Bias (°C)")
     ax3.set_title("Prediction Bias by Season")
     ax3.grid(True, alpha=0.3, axis="y")
-
-    # Add value labels
-    for bar, val in zip(bars, bias_by_season.values):
-        ax3.text(
-            bar.get_x() + bar.get_width() / 2,
-            val + 0.02 if val > 0 else val - 0.05,
-            f"{val:+.2f}",
-            ha="center",
-            va="bottom" if val > 0 else "top",
-            fontsize=10,
-        )
 
     # Panel 4: RMS by temperature trend category
     ax4 = axes[1, 1]
@@ -1014,8 +1106,8 @@ def fig8_comparison_nbeats_prophet_meteoblue():
     sns.set_style("white")
     sns.set_context("talk", font_scale=0.9)
 
-    # Load paper_results_v3.csv
-    results_file = RESULTS_PATH / "paper_results_v3.csv"
+    # Load paper_results_final.csv
+    results_file = RESULTS_PATH / "paper_results_final.csv"
     if not results_file.exists():
         print(
             f"  Warning: {results_file} not found. Run add_external_forecasts.py first."

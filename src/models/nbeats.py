@@ -61,6 +61,7 @@ from config import (
     DATA_PATH,
     FREQ,
     RESULTS_PATH,
+    NBEATS_CONFIG,
 )
 from config import (
     NBEATS_CACHE_PATH as MODEL_CACHE_PATH,
@@ -219,9 +220,9 @@ def train_nbeats_model(
     from neuralforecast.losses.pytorch import HuberLoss
     from neuralforecast.models import NBEATSx
 
-    # Cache path
+    # Cache path - v2 suffix indicates 4-stack architecture
     cutoff_str = cutoff_time.strftime("%Y%m%d")
-    cache_path = MODEL_CACHE_PATH / f"NBEATSx_deltaT_{cutoff_str}"
+    cache_path = MODEL_CACHE_PATH / f"NBEATSx_deltaT_v2_{cutoff_str}"
 
     if use_cache and cache_path.exists():
         print(f"  Loading cached model from {cache_path.name}")
@@ -263,15 +264,15 @@ def train_nbeats_model(
         max_steps=MAX_STEPS,
         hist_exog_list=hist_exog,
         futr_exog_list=futr_exog,
-        activation="SELU",
+        activation=NBEATS_CONFIG["activation"],
         loss=HuberLoss(),
-        learning_rate=0.01,
-        scaler_type="robust",
+        learning_rate=NBEATS_CONFIG["learning_rate"],
+        scaler_type=NBEATS_CONFIG["scaler_type"],
         enable_progress_bar=False,
         enable_model_summary=False,
-        stack_types=["trend", "seasonality", "exogenous"],
-        mlp_units=3 * [[32, 32]],
-        n_blocks=[1, 1, 1],
+        stack_types=NBEATS_CONFIG["stack_types"],
+        mlp_units=NBEATS_CONFIG["mlp_units"],
+        n_blocks=NBEATS_CONFIG["n_blocks"],
     )
 
     with suppress_stdout():
@@ -454,20 +455,22 @@ def predict_batch(
     forecast_times_out = [None] * n_requests
 
     futr_offsets = np.arange(1, HORIZON + 1) * np.timedelta64(FREQ_MINUTES, "m")
+    futr_step_offsets = np.arange(1, HORIZON + 1) * FREQ_SECONDS
 
-    # Process each twilight group
-    for tw_time, tw_requests in requests_by_tw.items():
-        last_tw_time = tw_requests[0][1]["last_tw_time"]
-        last_tw_idx = time_to_idx(last_tw_time)
+    # Helper function to process one twilight group
+    def process_tw_group(tw_time, tw_requests):
+        """Process all requests for one twilight event."""
+        results = []
+        last_tw_time_req = tw_requests[0][1]["last_tw_time"]
+        last_tw_idx = time_to_idx(last_tw_time_req)
         tw_idx = time_to_idx(tw_time)
 
         last_sunrise_time, last_sunrise_idx = get_last_sunrise_before(tw_idx)
 
         if last_sunrise_time is None:
-            continue
+            return results
 
         last_sunrise_time = pd.Timestamp(last_sunrise_time)
-        # next_sunrise = last_sunrise + 24h
         next_sunrise_time = last_sunrise_time + pd.Timedelta(hours=24)
 
         is_day = last_sunrise_idx > last_tw_idx
@@ -477,10 +480,11 @@ def predict_batch(
             base_progress = 0
             cycle_secs = (tw_time - last_sunrise_time).total_seconds()
         else:
-            ref_time = last_tw_time
+            ref_time = last_tw_time_req
             base_progress = 1
-            cycle_secs = (next_sunrise_time - last_tw_time).total_seconds()
+            cycle_secs = (next_sunrise_time - last_tw_time_req).total_seconds()
         cycle_secs = max(cycle_secs, 1)
+        ref_time_secs = ref_time.timestamp()
 
         # Process each request in the group
         for idx, req in tw_requests:
@@ -503,85 +507,112 @@ def predict_batch(
             if rows_before_tw > 0:
                 hist_slice[:rows_before_tw, 1] = hist_slice[:rows_before_tw, 0]
 
-            hist_matrix[idx] = hist_slice
-            hist_timestamps[idx] = timestamps[start_idx:end_idx]
-
             # Future timestamps start from end of history
             training_end = timestamps[end_idx - 1]
             training_end_np = np.datetime64(training_end)
-            futr_timestamps[idx] = training_end_np + futr_offsets
+            training_end_secs = pd.Timestamp(training_end).timestamp()
 
-            # twilight_cos calculation
-            training_end_ts = pd.Timestamp(training_end)
-            elapsed = (
-                (training_end_ts - ref_time).total_seconds()
-                + np.arange(1, HORIZON + 1) * FREQ_SECONDS
-            )
+            # twilight_cos calculation (vectorized)
+            elapsed = training_end_secs - ref_time_secs + futr_step_offsets
             progress = base_progress + np.clip(elapsed / cycle_secs, 0, 1)
-            futr_matrix[idx, :, 0] = np.cos(np.pi * progress)
+            twilight_cos = np.cos(np.pi * progress)
 
-            valid_mask[idx] = True
-            forecast_times_out[idx] = forecast_time
+            results.append((
+                idx,
+                hist_slice,
+                timestamps[start_idx:end_idx],
+                training_end_np + futr_offsets,
+                twilight_cos,
+                forecast_time,
+            ))
+
+        return results
+
+    # Process twilight groups in parallel
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(process_tw_group, tw_time, tw_reqs): tw_time
+            for tw_time, tw_reqs in requests_by_tw.items()
+        }
+
+        for future in as_completed(futures):
+            for idx, hist_slice, hist_ts, futr_ts, tw_cos, forecast_time in future.result():
+                hist_matrix[idx] = hist_slice
+                hist_timestamps[idx] = hist_ts
+                futr_timestamps[idx] = futr_ts
+                futr_matrix[idx, :, 0] = tw_cos
+                valid_mask[idx] = True
+                forecast_times_out[idx] = forecast_time
 
     valid_indices = np.where(valid_mask)[0]
     if len(valid_indices) == 0:
         return {}
 
-    # Convert to DataFrames for model input
-    combined_hist = pd.DataFrame(
-        {
-            "unique_id": np.repeat(
-                [f"pred_{i}" for i in valid_indices], INPUT_SIZE
-            ),
-            "ds": hist_timestamps[valid_indices].ravel(),
-            "y": hist_matrix[valid_indices, :, 1].ravel(),
-            **{
-                col: hist_matrix[valid_indices, :, i].ravel()
-                for i, col in enumerate(feature_cols)
-            },
-        }
-    )
-
-    combined_futr = pd.DataFrame(
-        {
-            "unique_id": np.repeat(
-                [f"pred_{i}" for i in valid_indices], HORIZON
-            ),
-            "ds": futr_timestamps[valid_indices].ravel(),
-            "twilight_cos": futr_matrix[valid_indices, :, 0].ravel(),
-        }
-    )
-
-    prediction_info = [
-        {
-            "unique_id": f"pred_{i}",
-            "req_idx": i,
-            "forecast_time": forecast_times_out[i],
-        }
-        for i in valid_indices
-    ]
-
-    # Run model inference
-    with suppress_stdout():
-        fc = model.predict(combined_hist, futr_df=combined_futr)
-
-    fc = fc.reset_index()
-    model_col = [c for c in fc.columns if c not in ["unique_id", "ds", "index"]][0]
-
-    # Extract results - use groupby for speed
+    # Process in batches of 100 requests for better memory/throughput
+    BATCH_SIZE = 100
     results = {}
-    fc_grouped = {uid: group for uid, group in fc.groupby("unique_id")}
+    model_col = None
 
-    for info in prediction_info:
-        uid = info["unique_id"]
-        if uid in fc_grouped:
-            uid_fc = fc_grouped[uid].sort_values("ds").reset_index(drop=True)
-            results[info["req_idx"]] = {
-                "forecast_time": info["forecast_time"],
-                "predictions": uid_fc[["ds", model_col]].rename(
-                    columns={model_col: "delta_T_pred"}
+    for batch_start in range(0, len(valid_indices), BATCH_SIZE):
+        batch_indices = valid_indices[batch_start : batch_start + BATCH_SIZE]
+
+        # Convert to DataFrames for model input
+        combined_hist = pd.DataFrame(
+            {
+                "unique_id": np.repeat(
+                    [f"pred_{i}" for i in batch_indices], INPUT_SIZE
                 ),
+                "ds": hist_timestamps[batch_indices].ravel(),
+                "y": hist_matrix[batch_indices, :, 1].ravel(),
+                **{
+                    col: hist_matrix[batch_indices, :, i].ravel()
+                    for i, col in enumerate(feature_cols)
+                },
             }
+        )
+
+        combined_futr = pd.DataFrame(
+            {
+                "unique_id": np.repeat(
+                    [f"pred_{i}" for i in batch_indices], HORIZON
+                ),
+                "ds": futr_timestamps[batch_indices].ravel(),
+                "twilight_cos": futr_matrix[batch_indices, :, 0].ravel(),
+            }
+        )
+
+        prediction_info = [
+            {
+                "unique_id": f"pred_{i}",
+                "req_idx": i,
+                "forecast_time": forecast_times_out[i],
+            }
+            for i in batch_indices
+        ]
+
+        # Run model inference for this batch
+        with suppress_stdout():
+            fc = model.predict(combined_hist, futr_df=combined_futr)
+
+        fc = fc.reset_index()
+        if model_col is None:
+            model_col = [c for c in fc.columns if c not in ["unique_id", "ds", "index"]][0]
+
+        # Extract results - use groupby for speed
+        fc_grouped = {uid: group for uid, group in fc.groupby("unique_id")}
+
+        for info in prediction_info:
+            uid = info["unique_id"]
+            if uid in fc_grouped:
+                uid_fc = fc_grouped[uid].sort_values("ds").reset_index(drop=True)
+                results[info["req_idx"]] = {
+                    "forecast_time": info["forecast_time"],
+                    "predictions": uid_fc[["ds", model_col]].rename(
+                        columns={model_col: "delta_T_pred"}
+                    ),
+                }
 
     return results
 
