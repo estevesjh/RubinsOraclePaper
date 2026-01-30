@@ -1,0 +1,180 @@
+# NbeatsxTrainer Configuration
+# ============================
+
+# Data settings
+data:
+  freq: "15min"
+  test_start_date: "2025-01-01"
+
+# =============================================================================
+# NBEATSx Model Configuration
+# =============================================================================
+nbeats:
+  # Architecture
+  horizon: 50              # Forecast horizon (13h at 15-min resolution)
+  input_size: 96           # Input window (24h at 15-min resolution)
+  max_steps: 200           # Training steps
+
+  # Model hyperparameters (optimized for winter performance)
+  activation: "SELU"       # Self-normalizing, better gradient flow
+  scaler_type: "robust"    # Less sensitive to outliers
+  learning_rate: 0.01      # Higher LR for faster adaptation
+
+  # Stack configuration (4-stack: 6.3% better than 3-stack)
+  stack_types:
+    - "trend"
+    - "seasonality"
+    - "identity"
+    - "exogenous"
+  n_blocks: [1, 1, 1, 1]
+  mlp_units:
+    - [32, 32]
+    - [32, 32]
+    - [32, 32]
+    - [32, 32]
+
+  # Historical Exogenous Features (8 features)
+  # These are available at prediction time from past observations
+  hist_exog:
+    - "temp_raw"                    # Raw temperature at current timestep (°C)
+    - "temp_last_sunrise"           # Temperature at most recent sunrise (°C)
+    - "trend_2h"                    # Linear temp slope over past 2h (°C/hour)
+    - "temp_trend_3d"               # 3-day temperature trend (°C/day)
+    - "rate_sunrise_to_midday"      # Heating rate sunrise→midday (°C/hour)
+    - "rate_midday_to_twilight"     # Cooling rate midday→twilight (°C/hour)
+    - "rate_twilight_to_midnight"   # Cooling rate twilight→midnight (°C/hour)
+    - "rate_midnight_to_sunrise"    # Cooling rate midnight→sunrise (°C/hour)
+
+  # Future Exogenous Features (1 feature)
+  # Known for future timesteps (deterministic)
+  futr_exog:
+    - "twilight_cos"                # Cosine encoding: +1 sunrise, -1 twilight
+
+  # Cache settings
+  cache_dir: "results/paper_nbeats_cache"
+  cache_prefix: "NBEATSx_deltaT_v2"
+
+# =============================================================================
+# Ridge Twilight Correction (multiple lead times)
+# =============================================================================
+# Corrects NBEATSx twilight predictions using h_to_tw based features
+ridge_twilight:
+  alpha: 1.0
+  # Lead times to train (hours before twilight) - same as ridge_trajectory
+  lead_hours:
+    - 0.5
+    - 1.0
+    - 1.5
+    - 2.0
+    - 2.5
+    - 3.0
+    - 3.5
+    - 4.0
+    - 4.5
+    - 5.0
+    - 5.5
+    - 6.0
+    - 6.5
+    - 7.0
+    - 7.5
+    - 8.0
+    - 8.5
+    - 9.0
+    - 9.5
+    - 10.0
+    - 10.5
+    - 11.0
+    - 11.5
+    - 12.0
+  target: "tw_slope"  # Target: twilight slope correction
+
+  # Features for Ridge Twilight Correction (h_to_tw based)
+  features:
+    # Core (1)
+    - "res"                         # NBEATSx residual at current h_to_tw (°C)
+
+    # h_to_tw based residuals (11) - residual at specific hours before twilight
+    - "res_htw_23"                  # Residual at 23h before twilight (just after prev_tw)
+    - "res_htw_21"                  # Residual at 21h before twilight
+    - "res_htw_19"                  # Residual at 19h before twilight
+    - "res_htw_17"                  # Residual at 17h before twilight
+    - "res_htw_15"                  # Residual at 15h before twilight
+    - "res_htw_13"                  # Residual at 13h before twilight (near sunrise)
+    - "res_htw_11"                  # Residual at 11h before twilight
+    - "res_htw_9"                   # Residual at 9h before twilight
+    - "res_htw_7"                   # Residual at 7h before twilight
+    - "res_htw_5"                   # Residual at 5h before twilight
+    - "res_htw_3"                   # Residual at 3h before twilight
+
+    # Diurnal Rates (4) - Temperature change rates
+    - "rate_sunrise_to_midday"      # Today's heating rate (°C/hour)
+    - "rate_midday_to_twilight"     # Previous day's cooling rate (°C/hour)
+    - "rate_twilight_to_midnight"   # Previous night's cooling rate (°C/hour)
+    - "rate_midnight_to_sunrise"    # Previous night's cooling rate (°C/hour)
+
+    # Temperature (1)
+    - "temp_since_sunrise"          # T_current - T_sunrise (°C)
+
+    # Seasonal (4)
+    - "day_length"                  # Hours of daylight (sunrise to twilight)
+    - "twilight_cos"                # Cosine encoding of diurnal progress
+    - "doy_sin"                     # sin(2π × DOY / 365)
+    - "doy_cos"                     # cos(2π × DOY / 365)
+
+    # Trend (1)
+    - "temp_trend_3d"               # 3-day temperature trend (°C/day)
+
+  # Cache settings
+  cache_dir: "results/paper_model_cache/sklearn_hourly_temps_with_trend"
+  cache_pattern: "linear_lead_{lead}h.joblib"
+
+# =============================================================================
+# Ridge Trajectory Correction (12 lead times, simple features)
+# =============================================================================
+# Corrects NBEATSx trajectory predictions at each lead time
+# Trains on forecasts with specific lead times (not nowcasts)
+# Simple features outperform res_htw features
+ridge_trajectory:
+  alpha: 1.0
+  target: "res"  # Target: residual (res = temp_actual - temp_approx)
+
+  # Lead times to train (1-12 hours)
+  lead_hours:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+
+  # Simple features (no res_htw - rate features work better)
+  features:
+    # Prediction features (2)
+    - "delta_T_pred"
+    - "temp_approx"
+
+    # Diurnal Rates (4)
+    - "rate_sunrise_to_midday"
+    - "rate_midday_to_twilight"
+    - "rate_twilight_to_midnight"
+    - "rate_midnight_to_sunrise"
+
+    # Temperature (2)
+    - "temp_since_sunrise"
+    - "temp_trend_3d"
+
+    # Seasonal (4) - added via code: doy_sin, doy_cos, hour_sin, hour_cos
+
+  # Optional: use Ridge-Tw slope prediction as feature
+  use_tw_slope: true
+  tw_slope_noise: 0.3  # std of noise added to simulate prediction uncertainty
+
+  # Cache settings
+  cache_dir: "results/paper_model_cache/traj_ridge"
+  cache_pattern: "traj_ridge_lead_{lead}h.joblib"
