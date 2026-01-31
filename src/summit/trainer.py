@@ -2,7 +2,7 @@
 
 Trains:
 1. NBEATSx - Delta T prediction model
-2. Ridge Twilight - Correction at 3h lead time
+2. Ridge Twilight - Forecast the twilight-trend slope
 3. Ridge Trajectory - Correction for all lead times
 """
 
@@ -15,8 +15,6 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 warnings.filterwarnings("ignore")
 
 import logging
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.getLogger("pytorch_lightning").setLevel(logging.CRITICAL)
 logging.getLogger("lightning.pytorch").setLevel(logging.CRITICAL)
@@ -33,23 +31,24 @@ from sklearn.preprocessing import StandardScaler
 FREQ_MINUTES = 15
 FREQ_SECONDS = FREQ_MINUTES * 60
 
+# Import predict_batch from models for consistent predictions
+import sys
+
 from .features import FeatureBuilder
 from .ridge_features import (
     RidgeFeatureBuilder,
-    extract_nowcasts,
     build_ridge_df,
     build_traj_df,
     compute_ridge_tw_rmse,
-    get_traj_features_for_lead,
+    extract_nowcasts,
 )
 from .sun_utils import get_sun_altitude
 
-# Import predict_batch from models for consistent predictions
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.nbeats import predict_batch
 
 # Default configuration (used if no YAML provided)
+# TODO: Update default config
 DEFAULT_CONFIG = {
     "data": {
         "freq": "15min",
@@ -81,7 +80,9 @@ DEFAULT_CONFIG = {
     },
     "ridge_twilight": {
         "alpha": 1.0,
-        "lead_hours": [h / 2 for h in range(1, 25)],  # 0.5 to 12.0 (any time after sunrise)
+        "lead_hours": [
+            h / 2 for h in range(1, 25)
+        ],  # 0.5 to 12.0 (any time after sunrise)
         "target": "tw_slope",
         # 20 features for Ridge correction
         "features": [
@@ -181,10 +182,10 @@ class NbeatsxTrainer:
         self.feature_builder = FeatureBuilder()
 
         # Cached DataFrames (populated during training)
-        self.df_features = None      # df with NBEATSx features added
-        self.nowcasts_df = None      # Nowcasts only (target_time == forecast_time)
-        self.ridge_df = None         # Nowcasts with Ridge features
-        self.traj_df = None          # All predictions for trajectory
+        self.df_features = None  # df with NBEATSx features added
+        self.nowcasts_df = None  # Nowcasts only (target_time == forecast_time)
+        self.ridge_df = None  # Nowcasts with Ridge features
+        self.traj_df = None  # All predictions for trajectory
 
         # Test data DataFrames (populated by compute_test_rmse_by_lead)
         self.test_predictions = None
@@ -251,7 +252,9 @@ class NbeatsxTrainer:
             raise ValueError("Data must have 'timestamp' or 'ds' column")
 
         df["ds"] = ts_utc.dt.tz_localize(None)  # UTC, tz-naive
-        df["ds_local"] = ts_utc.dt.tz_convert("America/Santiago").dt.tz_localize(None)  # Local, tz-naive
+        df["ds_local"] = ts_utc.dt.tz_convert("America/Santiago").dt.tz_localize(
+            None
+        )  # Local, tz-naive
 
         if "mean" in df.columns:
             df["y"] = df["mean"]
@@ -275,6 +278,7 @@ class NbeatsxTrainer:
         print(f"  Loaded {len(df)} rows")
         print(f"  Date range: {df['ds'].min()} to {df['ds'].max()}")
 
+        self.df_features = self._add_features(df)
         self.df = df
         return df
 
@@ -292,10 +296,14 @@ class NbeatsxTrainer:
         Uses extract_nowcasts() from ridge_features module.
         """
         if self._insample_predictions is None:
-            raise RuntimeError("Insample predictions not generated. Call _generate_insample_predictions() first.")
+            raise RuntimeError(
+                "Insample predictions not generated. Call _generate_insample_predictions() first."
+            )
 
         self.nowcasts_df = extract_nowcasts(self._insample_predictions)
-        print(f"\n[Nowcasts] Extracted {len(self.nowcasts_df)} nowcast rows from {len(self._insample_predictions)} predictions")
+        print(
+            f"\n[Nowcasts] Extracted {len(self.nowcasts_df)} nowcast rows from {len(self._insample_predictions)} predictions"
+        )
         return self.nowcasts_df
 
     def _make_ridge_df(self) -> pd.DataFrame:
@@ -304,12 +312,16 @@ class NbeatsxTrainer:
         Uses build_ridge_df() from ridge_features module.
         """
         if self.nowcasts_df is None:
-            raise RuntimeError("Nowcasts not extracted. Call _make_nowcasts_df() first.")
+            raise RuntimeError(
+                "Nowcasts not extracted. Call _make_nowcasts_df() first."
+            )
 
         if self.df_features is None:
             self.df_features = self._add_features(self.df)
 
-        self.ridge_df = build_ridge_df(self.nowcasts_df, self.df_features, mode="twilight")
+        self.ridge_df = build_ridge_df(
+            self.nowcasts_df, self.df_features, mode="twilight"
+        )
         print(f"[Ridge DF] Built {len(self.ridge_df)} rows with Ridge features")
         return self.ridge_df
 
@@ -319,10 +331,14 @@ class NbeatsxTrainer:
         Uses build_traj_df() from ridge_features module.
         """
         if self._insample_predictions is None:
-            raise RuntimeError("Insample predictions not generated. Call _generate_insample_predictions() first.")
+            raise RuntimeError(
+                "Insample predictions not generated. Call _generate_insample_predictions() first."
+            )
 
         self.traj_df = build_traj_df(self._insample_predictions)
-        print(f"\n[Traj DF] Using {len(self.traj_df)} predictions for trajectory training")
+        print(
+            f"\n[Traj DF] Using {len(self.traj_df)} predictions for trajectory training"
+        )
         return self.traj_df
 
     def _save_predictions(self, predictions: pd.DataFrame, cache_path: Path) -> None:
@@ -366,7 +382,9 @@ class NbeatsxTrainer:
             lead_hours = self.config["ridge_twilight"]["lead_hours"]
 
         if not self._tw_ridge_models:
-            raise RuntimeError("No Ridge-Tw models trained. Call train_ridge_twilight() first.")
+            raise RuntimeError(
+                "No Ridge-Tw models trained. Call train_ridge_twilight() first."
+            )
 
         # Get feature columns
         ridge_fb = RidgeFeatureBuilder(mode="twilight")
@@ -385,10 +403,12 @@ class NbeatsxTrainer:
         if label:
             print(f"\n  {label} RMSE by Lead Time:")
             print(f"  {'Lead':<8} {'RMSE':<10} {'Bias':<10} {'N':<8}")
-            print(f"  {'-'*36}")
+            print(f"  {'-' * 36}")
             for lead in sorted(results.keys()):
                 r = results[lead]
-                print(f"  {lead:<8.1f} {r['rmse']:<10.3f} {r['bias']:<10.3f} {r['n']:<8}")
+                print(
+                    f"  {lead:<8.1f} {r['rmse']:<10.3f} {r['bias']:<10.3f} {r['n']:<8}"
+                )
 
         return results
 
@@ -430,7 +450,7 @@ class NbeatsxTrainer:
             raise RuntimeError("Data not loaded. Call load_data() first.")
 
         # Add features
-        df = self._add_features(self.df)
+        df = self.df_features.copy()
 
         # Filter to training data (before test start, if specified)
         # Use ds_local for date-based filtering since dates are in local time
@@ -438,7 +458,9 @@ class NbeatsxTrainer:
             test_start = pd.Timestamp(data_cfg["test_start_date"])
             train_df = df[df["ds_local"] < test_start].copy()
             print(f"  test_start_date cutoff: {test_start} (local time)")
-            print(f"  Training data: {train_df['ds_local'].min()} to {train_df['ds_local'].max()}")
+            print(
+                f"  Training data: {train_df['ds_local'].min()} to {train_df['ds_local'].max()}"
+            )
         else:
             train_df = df.copy()
         print(f"  Training samples: {len(train_df)}")
@@ -481,7 +503,9 @@ class NbeatsxTrainer:
         self._nbeats_model = nf
         return nf
 
-    def _generate_insample_predictions(self, pred_times_hours: list = None, use_cache: bool = True) -> pd.DataFrame:
+    def _generate_insample_predictions(
+        self, pred_times_hours: list = None, use_cache: bool = True
+    ) -> pd.DataFrame:
         """Generate in-sample NBEATSx predictions for Ridge training.
 
         Uses predict_batch from summit.nbeats for efficient batched inference.
@@ -514,14 +538,19 @@ class NbeatsxTrainer:
             raise RuntimeError("Data not loaded. Call load_data() first.")
 
         print("\n[In-sample Predictions] Generating NBEATSx predictions...")
-        print(f"  Prediction times: {len(pred_times_hours)} (from {min(pred_times_hours)}h to {max(pred_times_hours)}h from last tw)")
+        print(
+            f"  Prediction times: {len(pred_times_hours)} (from {min(pred_times_hours)}h to {max(pred_times_hours)}h from last tw)"
+        )
 
         cfg = self.config["nbeats"]
         data_cfg = self.config["data"]
         INPUT_SIZE = cfg["input_size"]
 
         # Use FeatureBuilder to compute delta_T and delta_T_approx
-        df = self._add_features(self.df)
+        if self.df_features is None:
+            df = self._add_features(self.df)
+        else:
+            df = self.df_features.copy()
 
         # Filter to training data (if test_start_date specified)
         # Use ds_local for date-based filtering since dates are in local time
@@ -529,7 +558,9 @@ class NbeatsxTrainer:
             test_start = pd.Timestamp(data_cfg["test_start_date"])
             train_df = df[df["ds_local"] < test_start].copy()
             print(f"  test_start_date cutoff: {test_start} (local time)")
-            print(f"  Training data: {train_df['ds_local'].min()} to {train_df['ds_local'].max()}")
+            print(
+                f"  Training data: {train_df['ds_local'].min()} to {train_df['ds_local'].max()}"
+            )
         else:
             train_df = df.copy()
 
@@ -571,22 +602,28 @@ class NbeatsxTrainer:
             for h_from_last_tw in pred_times_hours:
                 forecast_time = prev_tw_ts + pd.Timedelta(hours=h_from_last_tw)
 
-                prediction_requests.append({
-                    "forecast_time": forecast_time,
-                    "tw_time": tw_ts,
-                    "last_tw_time": prev_tw_ts,
-                })
-                request_metadata.append({
-                    "tw_time": tw_ts,
-                    "tw_time_local": tw_time_local,
-                    "tw_temp": tw_temp,
-                    "T_tw_last": T_tw_prev,
-                    "prev_tw_time": prev_tw_ts,
-                    "h_from_last_tw": h_from_last_tw,
-                    "tw_row": tw_row,
-                })
+                prediction_requests.append(
+                    {
+                        "forecast_time": forecast_time,
+                        "tw_time": tw_ts,
+                        "last_tw_time": prev_tw_ts,
+                    }
+                )
+                request_metadata.append(
+                    {
+                        "tw_time": tw_ts,
+                        "tw_time_local": tw_time_local,
+                        "tw_temp": tw_temp,
+                        "T_tw_last": T_tw_prev,
+                        "prev_tw_time": prev_tw_ts,
+                        "h_from_last_tw": h_from_last_tw,
+                        "tw_row": tw_row,
+                    }
+                )
 
-        print(f"  Requests: {len(prediction_requests)} (skipped {skipped} early twilights)")
+        print(
+            f"  Requests: {len(prediction_requests)} (skipped {skipped} early twilights)"
+        )
 
         if len(prediction_requests) == 0:
             self._insample_predictions = pd.DataFrame()
@@ -609,16 +646,26 @@ class NbeatsxTrainer:
             meta = request_metadata[req_idx]
             pred_df = result["predictions"].copy()
             pred_df["req_idx"] = req_idx
-            pred_df["tw_time"] = meta["tw_time"]
+            pred_df["tw_time"] = meta["tw_time"]  # UTC
             pred_df["tw_temp"] = meta["tw_temp"]
             pred_df["T_tw_last"] = meta["T_tw_last"]
             pred_df["prev_tw_time"] = meta["prev_tw_time"]
             pred_df["forecast_time"] = result["forecast_time"]
-            pred_df["rate_sunrise_to_midday"] = meta["tw_row"].get("rate_sunrise_to_midday", np.nan)
-            pred_df["rate_midday_to_twilight"] = meta["tw_row"].get("rate_midday_to_twilight", np.nan)
-            pred_df["rate_twilight_to_midnight"] = meta["tw_row"].get("rate_twilight_to_midnight", np.nan)
-            pred_df["rate_midnight_to_sunrise"] = meta["tw_row"].get("rate_midnight_to_sunrise", np.nan)
-            pred_df["temp_since_sunrise"] = meta["tw_row"].get("temp_since_sunrise", np.nan)
+            pred_df["rate_sunrise_to_midday"] = meta["tw_row"].get(
+                "rate_sunrise_to_midday", np.nan
+            )
+            pred_df["rate_midday_to_twilight"] = meta["tw_row"].get(
+                "rate_midday_to_twilight", np.nan
+            )
+            pred_df["rate_twilight_to_midnight"] = meta["tw_row"].get(
+                "rate_twilight_to_midnight", np.nan
+            )
+            pred_df["rate_midnight_to_sunrise"] = meta["tw_row"].get(
+                "rate_midnight_to_sunrise", np.nan
+            )
+            pred_df["temp_since_sunrise"] = meta["tw_row"].get(
+                "temp_since_sunrise", np.nan
+            )
             pred_df["temp_trend_3d"] = meta["tw_row"].get("temp_trend_3d", np.nan)
             all_preds.append(pred_df)
 
@@ -631,7 +678,9 @@ class NbeatsxTrainer:
         pred_df["prev_tw_time"] = pd.to_datetime(pred_df["prev_tw_time"])
 
         # Compute target indices for temperature lookup
-        target_idx = ((pred_df["target_time"] - t0).dt.total_seconds() // FREQ_SECONDS).astype(int)
+        target_idx = (
+            (pred_df["target_time"] - t0).dt.total_seconds() // FREQ_SECONDS
+        ).astype(int)
 
         # Filter valid indices
         valid_mask = (target_idx >= 0) & (target_idx < len(y_values))
@@ -645,9 +694,15 @@ class NbeatsxTrainer:
         pred_df = pred_df[~pred_df["temp_actual"].isna()].copy()
 
         # Compute derived columns (vectorized)
-        pred_df["h_from_last_tw"] = (pred_df["target_time"] - pred_df["prev_tw_time"]).dt.total_seconds() / 3600
-        pred_df["h_to_tw"] = (pred_df["tw_time"] - pred_df["target_time"]).dt.total_seconds() / 3600
-        pred_df["lead_hours"] = (pred_df["target_time"] - pred_df["forecast_time"]).dt.total_seconds() / 3600
+        pred_df["h_from_last_tw"] = (
+            pred_df["target_time"] - pred_df["prev_tw_time"]
+        ).dt.total_seconds() / 3600
+        pred_df["h_to_tw"] = (
+            pred_df["tw_time"] - pred_df["target_time"]
+        ).dt.total_seconds() / 3600
+        pred_df["lead_hours"] = (
+            pred_df["target_time"] - pred_df["forecast_time"]
+        ).dt.total_seconds() / 3600
 
         # Apply exponential boundary gate to delta_T_pred
         # Gate = 1 - exp(-|h_to_tw| / tau), tau = 1 hour
@@ -688,7 +743,10 @@ class NbeatsxTrainer:
         if lead_times is None:
             lead_times = [3, 6, 12]
 
-        if not hasattr(self, "_insample_predictions") or self._insample_predictions is None:
+        if (
+            not hasattr(self, "_insample_predictions")
+            or self._insample_predictions is None
+        ):
             return {}
 
         # Ensure ridge_df (nowcasts with features) is built
@@ -717,9 +775,15 @@ class NbeatsxTrainer:
         metrics = {"oracle": {}, "ridge": {}, "ridge_traj": {}}
 
         # Debug: show data ranges
-        print(f"  h_to_tw range: {ridge_df['h_to_tw'].min():.2f} to {ridge_df['h_to_tw'].max():.2f}")
-        print(f"  h_from_last_tw range: {ridge_df['h_from_last_tw'].min():.2f} to {ridge_df['h_from_last_tw'].max():.2f}")
-        print(f"  tw_slope range: {ridge_df['tw_slope'].min():.2f} to {ridge_df['tw_slope'].max():.2f}")
+        print(
+            f"  h_to_tw range: {ridge_df['h_to_tw'].min():.2f} to {ridge_df['h_to_tw'].max():.2f}"
+        )
+        print(
+            f"  h_from_last_tw range: {ridge_df['h_from_last_tw'].min():.2f} to {ridge_df['h_from_last_tw'].max():.2f}"
+        )
+        print(
+            f"  tw_slope range: {ridge_df['tw_slope'].min():.2f} to {ridge_df['tw_slope'].max():.2f}"
+        )
 
         # Compute metrics for each lead time
         for lead in lead_times:
@@ -738,8 +802,12 @@ class NbeatsxTrainer:
 
             # Debug: show h_from_last_tw distribution at this lead time
             print(f"\n  @ {lead}h lead: {len(lead_df)} samples")
-            print(f"    h_from_last_tw: {lead_df['h_from_last_tw'].min():.1f} to {lead_df['h_from_last_tw'].max():.1f}")
-            print(f"    h_to_tw: {lead_df['h_to_tw'].min():.1f} to {lead_df['h_to_tw'].max():.1f}")
+            print(
+                f"    h_from_last_tw: {lead_df['h_from_last_tw'].min():.1f} to {lead_df['h_from_last_tw'].max():.1f}"
+            )
+            print(
+                f"    h_to_tw: {lead_df['h_to_tw'].min():.1f} to {lead_df['h_to_tw'].max():.1f}"
+            )
 
             # =====================================================================
             # NBEATSx-Oracle: uses true Twilight_Trend (future info - cheating)
@@ -747,15 +815,30 @@ class NbeatsxTrainer:
             # where Twilight_Trend(h) = T_tw_last + tw_slope * h/24
             # Note: delta_T_gated has boundary gate applied (delta_T -> 0 near twilight)
             # =====================================================================
-            oracle_valid = lead_df[["temp_actual", "delta_T_gated", "T_tw_last", "tw_slope", "h_from_last_tw"]].dropna()
+            oracle_valid = lead_df[
+                [
+                    "temp_actual",
+                    "delta_T_gated",
+                    "T_tw_last",
+                    "tw_slope",
+                    "h_from_last_tw",
+                ]
+            ].dropna()
             if len(oracle_valid) > 0:
                 h = oracle_valid["h_from_last_tw"].values
-                twilight_trend = oracle_valid["T_tw_last"].values + oracle_valid["tw_slope"].values * h / 24.0
+                twilight_trend = (
+                    oracle_valid["T_tw_last"].values
+                    + oracle_valid["tw_slope"].values * h / 24.0
+                )
                 T_pred_oracle = oracle_valid["delta_T_gated"].values + twilight_trend
                 errors_oracle = oracle_valid["temp_actual"].values - T_pred_oracle
-                rmse_oracle = float(np.sqrt(np.mean(errors_oracle ** 2)))
+                rmse_oracle = float(np.sqrt(np.mean(errors_oracle**2)))
                 bias_oracle = float(np.mean(errors_oracle))
-                metrics["oracle"][lead_key] = {"rmse": rmse_oracle, "bias": bias_oracle, "n": len(errors_oracle)}
+                metrics["oracle"][lead_key] = {
+                    "rmse": rmse_oracle,
+                    "bias": bias_oracle,
+                    "n": len(errors_oracle),
+                }
 
             # =====================================================================
             # NBEATSx-Ridge-Traj: direct residual correction (no slope)
@@ -763,13 +846,18 @@ class NbeatsxTrainer:
             # =====================================================================
             # Use trajectory model for each lead time (skip if features not in ridge_df)
             lead_float = float(lead)
-            if lead_float in self._traj_ridge_models and lead_float in self._traj_ridge_features:
+            if (
+                lead_float in self._traj_ridge_models
+                and lead_float in self._traj_ridge_features
+            ):
                 ridge_model = self._traj_ridge_models[lead_float]
                 ridge_scaler = self._traj_ridge_scalers[lead_float]
                 traj_features = self._traj_ridge_features[lead_float]
 
                 # Check if features exist in ridge_df
-                missing_features = [f for f in traj_features if f not in lead_df.columns]
+                missing_features = [
+                    f for f in traj_features if f not in lead_df.columns
+                ]
                 if missing_features:
                     # Skip Ridge-Traj if features don't exist (different feature naming)
                     pass
@@ -785,9 +873,13 @@ class NbeatsxTrainer:
                         # Direct correction: T_pred = temp_approx + res_pred
                         T_pred_ridge = valid_df["temp_approx"].values + res_pred
                         errors_ridge = valid_df["temp_actual"].values - T_pred_ridge
-                        rmse_ridge = float(np.sqrt(np.mean(errors_ridge ** 2)))
+                        rmse_ridge = float(np.sqrt(np.mean(errors_ridge**2)))
                         bias_ridge = float(np.mean(errors_ridge))
-                        metrics["ridge_traj"][lead_key] = {"rmse": rmse_ridge, "bias": bias_ridge, "n": len(errors_ridge)}
+                        metrics["ridge_traj"][lead_key] = {
+                            "rmse": rmse_ridge,
+                            "bias": bias_ridge,
+                            "n": len(errors_ridge),
+                        }
 
             # =====================================================================
             # NBEATSx-Ridge (twilight prediction) - uses tw_slope models
@@ -813,21 +905,31 @@ class NbeatsxTrainer:
 
                         T_tw_pred = valid_df["T_tw_last"].values + slope_pred
                         errors_tw = valid_df["tw_temp"].values - T_tw_pred
-                        rmse_tw = float(np.sqrt(np.mean(errors_tw ** 2)))
+                        rmse_tw = float(np.sqrt(np.mean(errors_tw**2)))
                         bias_tw = float(np.mean(errors_tw))
-                        metrics["ridge"][lead_key] = {"rmse": rmse_tw, "bias": bias_tw, "n": len(errors_tw)}
+                        metrics["ridge"][lead_key] = {
+                            "rmse": rmse_tw,
+                            "bias": bias_tw,
+                            "n": len(errors_tw),
+                        }
 
         # Print summary
         print("\n  Model Performance Summary:")
-        print(f"  {'Lead':<6} {'Oracle':<12} {'Ridge-Traj':<12} {'Ridge-TW':<12} {'N':<8}")
-        print(f"  {'-'*50}")
+        print(
+            f"  {'Lead':<6} {'Oracle':<12} {'Ridge-Traj':<12} {'Ridge-TW':<12} {'N':<8}"
+        )
+        print(f"  {'-' * 50}")
         for lead in lead_times:
             lead_key = f"{lead}h"
             oracle_rmse = metrics["oracle"].get(lead_key, {}).get("rmse", np.nan)
-            ridge_traj_rmse = metrics["ridge_traj"].get(lead_key, {}).get("rmse", np.nan)
+            ridge_traj_rmse = (
+                metrics["ridge_traj"].get(lead_key, {}).get("rmse", np.nan)
+            )
             ridge_tw_rmse = metrics["ridge"].get(lead_key, {}).get("rmse", np.nan)
             n = metrics["oracle"].get(lead_key, {}).get("n", 0)
-            print(f"  {lead_key:<6} {oracle_rmse:<12.3f} {ridge_traj_rmse:<12.3f} {ridge_tw_rmse:<12.3f} {n:<8}")
+            print(
+                f"  {lead_key:<6} {oracle_rmse:<12.3f} {ridge_traj_rmse:<12.3f} {ridge_tw_rmse:<12.3f} {n:<8}"
+            )
 
         self._insample_metrics = metrics
         return metrics
@@ -858,7 +960,10 @@ class NbeatsxTrainer:
             raise RuntimeError("NBEATSx model not trained. Call train_nbeats() first.")
 
         # Generate in-sample predictions if not available
-        if not hasattr(self, "_insample_predictions") or self._insample_predictions is None:
+        if (
+            not hasattr(self, "_insample_predictions")
+            or self._insample_predictions is None
+        ):
             self._generate_insample_predictions()
 
         # Build nowcasts_df and ridge_df using helper methods
@@ -911,8 +1016,12 @@ class NbeatsxTrainer:
             if lead in [3.0, 6.0, 12.0]:
                 n_twilights = df_lead["tw_time"].nunique()
                 samples_per_tw = len(df_lead) / n_twilights if n_twilights > 0 else 0
-                h_to_tw_range = f"{df_lead['h_to_tw'].min():.1f} to {df_lead['h_to_tw'].max():.1f}"
-                print(f"  Training {lead}h: {len(df_lead)} samples, {n_twilights} twilights, ~{samples_per_tw:.1f} samples/tw, h_to_tw: {h_to_tw_range}")
+                h_to_tw_range = (
+                    f"{df_lead['h_to_tw'].min():.1f} to {df_lead['h_to_tw'].max():.1f}"
+                )
+                print(
+                    f"  Training {lead}h: {len(df_lead)} samples, {n_twilights} twilights, ~{samples_per_tw:.1f} samples/tw, h_to_tw: {h_to_tw_range}"
+                )
 
             # Train
             X = df_lead[available_features].values
@@ -965,7 +1074,10 @@ class NbeatsxTrainer:
             raise RuntimeError("NBEATSx model not trained. Call train_nbeats() first.")
 
         # Generate predictions if not available
-        if not hasattr(self, "_insample_predictions") or self._insample_predictions is None:
+        if (
+            not hasattr(self, "_insample_predictions")
+            or self._insample_predictions is None
+        ):
             self._generate_insample_predictions()
 
         # Prepare prediction DataFrame with features
@@ -990,19 +1102,31 @@ class NbeatsxTrainer:
         pred_df["lead_hours_int"] = pred_df["lead_hours"].round().astype(int)
 
         # Feature columns (simple, no res_htw)
-        feature_cols = cfg.get("features", [
-            "delta_T_pred", "temp_approx",
-            "rate_sunrise_to_midday", "rate_midday_to_twilight",
-            "rate_twilight_to_midnight", "rate_midnight_to_sunrise",
-            "temp_since_sunrise", "temp_trend_3d",
-            "doy_sin", "doy_cos", "hour_sin", "hour_cos",
-        ])
+        feature_cols = cfg.get(
+            "features",
+            [
+                "delta_T_pred",
+                "temp_approx",
+                "rate_sunrise_to_midday",
+                "rate_midday_to_twilight",
+                "rate_twilight_to_midnight",
+                "rate_midnight_to_sunrise",
+                "temp_since_sunrise",
+                "temp_trend_3d",
+                "doy_sin",
+                "doy_cos",
+                "hour_sin",
+                "hour_cos",
+            ],
+        )
 
         # Optionally add tw_slope with noise as feature
         if cfg.get("use_tw_slope", False):
             noise_std = cfg.get("tw_slope_noise", 0.3)
             np.random.seed(42)
-            pred_df["tw_slope_noisy"] = pred_df["tw_slope"] + np.random.normal(0, noise_std, len(pred_df))
+            pred_df["tw_slope_noisy"] = pred_df["tw_slope"] + np.random.normal(
+                0, noise_std, len(pred_df)
+            )
             feature_cols = feature_cols + ["tw_slope_noisy"]
 
         target_col = cfg.get("target", "res")
@@ -1019,7 +1143,11 @@ class NbeatsxTrainer:
             if use_cache and cache_path.exists():
                 data = joblib.load(cache_path)
                 if isinstance(data, tuple) and len(data) == 3:
-                    self._traj_ridge_models[lead], self._traj_ridge_scalers[lead], self._traj_ridge_features[lead] = data
+                    (
+                        self._traj_ridge_models[lead],
+                        self._traj_ridge_scalers[lead],
+                        self._traj_ridge_features[lead],
+                    ) = data
                     loaded_count += 1
                     continue
 
@@ -1032,7 +1160,9 @@ class NbeatsxTrainer:
                 continue
 
             # Drop rows with NaN
-            df_lead = df_lead.dropna(subset=feature_cols + [target_col, "temp_actual", "temp_approx"])
+            df_lead = df_lead.dropna(
+                subset=feature_cols + [target_col, "temp_actual", "temp_approx"]
+            )
 
             if len(df_lead) < 50:
                 print(f"  Skipping {lead}h: only {len(df_lead)} samples")
@@ -1061,11 +1191,17 @@ class NbeatsxTrainer:
             X_test = scaler.transform(test_df[feature_cols].values)
             res_pred = model.predict(X_test)
             temp_pred = test_df["temp_approx"].values + res_pred
-            ridge_rmse = float(np.sqrt(np.mean((test_df["temp_actual"].values - temp_pred) ** 2)))
-            nbeats_rmse = float(np.sqrt(np.mean((test_df["temp_actual"] - test_df["temp_approx"]) ** 2)))
+            ridge_rmse = float(
+                np.sqrt(np.mean((test_df["temp_actual"].values - temp_pred) ** 2))
+            )
+            nbeats_rmse = float(
+                np.sqrt(np.mean((test_df["temp_actual"] - test_df["temp_approx"]) ** 2))
+            )
             improvement = (nbeats_rmse - ridge_rmse) / nbeats_rmse * 100
 
-            print(f"  Lead {lead}h: n={len(train_df)}, NBEATSx={nbeats_rmse:.3f}, Ridge={ridge_rmse:.3f} ({improvement:+.1f}%)")
+            print(
+                f"  Lead {lead}h: n={len(train_df)}, NBEATSx={nbeats_rmse:.3f}, Ridge={ridge_rmse:.3f} ({improvement:+.1f}%)"
+            )
 
             # Save model, scaler, and feature columns
             joblib.dump((model, scaler, feature_cols), cache_path)
@@ -1108,7 +1244,10 @@ class NbeatsxTrainer:
         print(f"\n[Test Predictions] Generating for data >= {test_start}")
 
         # Add features to full dataset
-        df = self._add_features(self.df)
+        if self.df_features is None:
+            df = self._add_features(self.df)
+        else:
+            df = self.df_features.copy()
 
         # Get twilight events in test period
         test_df = df[df["ds_local"] >= test_start].copy()
@@ -1121,12 +1260,12 @@ class NbeatsxTrainer:
         print(f"  Twilight events: {len(twilight_events)}")
 
         # Build prediction requests
-        pred_times_hours = list(range(1, 22))
+        pred_times_hours = list(range(1, 24))
         prediction_requests = []
         request_metadata = []
 
         for _, tw_row in twilight_events.iterrows():
-            tw_ts = pd.Timestamp(tw_row["ds"])
+            tw_ts = pd.Timestamp(tw_row["ds"])  # UTC
             if tw_ts.tz is not None:
                 tw_ts = tw_ts.tz_localize(None)
 
@@ -1141,18 +1280,22 @@ class NbeatsxTrainer:
 
             for h in pred_times_hours:
                 forecast_time = prev_tw_ts + pd.Timedelta(hours=h)
-                prediction_requests.append({
-                    "forecast_time": forecast_time,
-                    "tw_time": tw_ts,
-                    "last_tw_time": prev_tw_ts,
-                })
-                request_metadata.append({
-                    "tw_time": tw_ts,
-                    "tw_temp": tw_row["twilight_temp"],
-                    "T_tw_last": T_tw_prev,
-                    "prev_tw_time": prev_tw_ts,
-                    "tw_row": tw_row,
-                })
+                prediction_requests.append(
+                    {
+                        "forecast_time": forecast_time,
+                        "tw_time": tw_ts,
+                        "last_tw_time": prev_tw_ts,
+                    }
+                )
+                request_metadata.append(
+                    {
+                        "tw_time": tw_ts,
+                        "tw_temp": tw_row["twilight_temp"],
+                        "T_tw_last": T_tw_prev,
+                        "prev_tw_time": prev_tw_ts,
+                        "tw_row": tw_row,
+                    }
+                )
 
         print(f"  Prediction requests: {len(prediction_requests)}")
 
@@ -1169,14 +1312,19 @@ class NbeatsxTrainer:
         for req_idx, result in results.items():
             meta = request_metadata[req_idx]
             pred_row = result["predictions"].copy()
-            pred_row["tw_time"] = meta["tw_time"]
+            pred_row["tw_time"] = meta["tw_time"]  # UTC
             pred_row["tw_temp"] = meta["tw_temp"]
             pred_row["T_tw_last"] = meta["T_tw_last"]
             pred_row["prev_tw_time"] = meta["prev_tw_time"]
             pred_row["forecast_time"] = result["forecast_time"]
-            for col in ["rate_sunrise_to_midday", "rate_midday_to_twilight",
-                        "rate_twilight_to_midnight", "rate_midnight_to_sunrise",
-                        "temp_since_sunrise", "temp_trend_3d"]:
+            for col in [
+                "rate_sunrise_to_midday",
+                "rate_midday_to_twilight",
+                "rate_twilight_to_midnight",
+                "rate_midnight_to_sunrise",
+                "temp_since_sunrise",
+                "temp_trend_3d",
+            ]:
                 pred_row[col] = meta["tw_row"].get(col, np.nan)
             all_preds.append(pred_row)
 
@@ -1187,7 +1335,9 @@ class NbeatsxTrainer:
         pred_df["prev_tw_time"] = pd.to_datetime(pred_df["prev_tw_time"])
 
         # Lookup actual temperatures
-        target_idx = ((pred_df["target_time"] - t0).dt.total_seconds() // FREQ_SECONDS).astype(int)
+        target_idx = (
+            (pred_df["target_time"] - t0).dt.total_seconds() // FREQ_SECONDS
+        ).astype(int)
         valid_mask = (target_idx >= 0) & (target_idx < len(y_values))
         pred_df = pred_df[valid_mask].copy()
         target_idx = target_idx[valid_mask]
@@ -1195,8 +1345,12 @@ class NbeatsxTrainer:
         pred_df = pred_df[~pred_df["temp_actual"].isna()].copy()
 
         # Compute derived columns
-        pred_df["h_from_last_tw"] = (pred_df["target_time"] - pred_df["prev_tw_time"]).dt.total_seconds() / 3600
-        pred_df["h_to_tw"] = (pred_df["tw_time"] - pred_df["target_time"]).dt.total_seconds() / 3600
+        pred_df["h_from_last_tw"] = (
+            pred_df["target_time"] - pred_df["prev_tw_time"]
+        ).dt.total_seconds() / 3600
+        pred_df["h_to_tw"] = (
+            pred_df["tw_time"] - pred_df["target_time"]
+        ).dt.total_seconds() / 3600
 
         # Apply boundary gate
         TAU = 1.0
@@ -1220,7 +1374,9 @@ class NbeatsxTrainer:
             DataFrame with Ridge features for test data
         """
         if self.test_predictions is None:
-            raise RuntimeError("Test predictions not generated. Call _generate_test_predictions() first.")
+            raise RuntimeError(
+                "Test predictions not generated. Call _generate_test_predictions() first."
+            )
 
         if self.df_features is None:
             self.df_features = self._add_features(self.df)
@@ -1230,12 +1386,16 @@ class NbeatsxTrainer:
         print(f"[Test Nowcasts] Extracted {len(self.test_nowcasts_df)} rows")
 
         # Build Ridge features
-        self.test_ridge_df = build_ridge_df(self.test_nowcasts_df, self.df_features, mode="twilight")
+        self.test_ridge_df = build_ridge_df(
+            self.test_nowcasts_df, self.df_features, mode="twilight"
+        )
         print(f"[Test Ridge DF] Built {len(self.test_ridge_df)} rows")
 
         return self.test_ridge_df
 
-    def compute_test_rmse(self, lead_times: list = None, use_cache: bool = True) -> dict:
+    def compute_test_rmse(
+        self, lead_times: list = None, use_cache: bool = True
+    ) -> dict:
         """Compute RMSE on test data using Ridge-Tw models.
 
         Args:
@@ -1263,7 +1423,9 @@ class NbeatsxTrainer:
             label="Test",
         )
 
-        self._test_metrics = {"ridge": {f"{lead}h": results.get(lead, {}) for lead in lead_times}}
+        self._test_metrics = {
+            "ridge": {f"{lead}h": results.get(lead, {}) for lead in lead_times}
+        }
         return results
 
     # Backward compatibility aliases
@@ -1341,27 +1503,37 @@ class NbeatsxTrainer:
         if hasattr(self, "_insample_metrics") and self._insample_metrics:
             print("\nIn-Sample Performance @ 3h Lead Time:")
             print(f"  {'Model':<20} {'RMSE':>8} {'N':>8}")
-            print(f"  {'-'*36}")
+            print(f"  {'-' * 36}")
 
             m = self._insample_metrics
             if "nbeats" in m and "3h" in m["nbeats"]:
-                print(f"  {'NBEATSx':<20} {m['nbeats']['3h']['rmse']:>8.3f} {m['nbeats']['3h']['n']:>8}")
+                print(
+                    f"  {'NBEATSx':<20} {m['nbeats']['3h']['rmse']:>8.3f} {m['nbeats']['3h']['n']:>8}"
+                )
             if "ridge_tw" in m and "3h" in m["ridge_tw"]:
-                print(f"  {'NBEATSx-Ridge':<20} {m['ridge_tw']['3h']['rmse']:>8.3f} {m['ridge_tw']['3h']['n']:>8}")
+                print(
+                    f"  {'NBEATSx-Ridge':<20} {m['ridge_tw']['3h']['rmse']:>8.3f} {m['ridge_tw']['3h']['n']:>8}"
+                )
             if "ridge_traj" in m and "3h" in m["ridge_traj"]:
-                print(f"  {'NBEATSx-Ridge-Traj':<20} {m['ridge_traj']['3h']['rmse']:>8.3f} {m['ridge_traj']['3h']['n']:>8}")
+                print(
+                    f"  {'NBEATSx-Ridge-Traj':<20} {m['ridge_traj']['3h']['rmse']:>8.3f} {m['ridge_traj']['3h']['n']:>8}"
+                )
 
         # Test performance metrics
         if hasattr(self, "_test_metrics") and self._test_metrics:
             print("\nTest Performance @ 3h Lead Time:")
             print(f"  {'Model':<20} {'RMSE':>8} {'N':>8}")
-            print(f"  {'-'*36}")
+            print(f"  {'-' * 36}")
 
             m = self._test_metrics
             if "oracle" in m and "3h" in m["oracle"]:
-                print(f"  {'NBEATSx-Oracle':<20} {m['oracle']['3h']['rmse']:>8.3f} {m['oracle']['3h']['n']:>8}")
+                print(
+                    f"  {'NBEATSx-Oracle':<20} {m['oracle']['3h']['rmse']:>8.3f} {m['oracle']['3h']['n']:>8}"
+                )
             if "ridge_traj" in m and "3h" in m["ridge_traj"]:
-                print(f"  {'NBEATSx-Ridge-Traj':<20} {m['ridge_traj']['3h']['rmse']:>8.3f} {m['ridge_traj']['3h']['n']:>8}")
+                print(
+                    f"  {'NBEATSx-Ridge-Traj':<20} {m['ridge_traj']['3h']['rmse']:>8.3f} {m['ridge_traj']['3h']['n']:>8}"
+                )
 
         print("=" * 60)
 
