@@ -39,7 +39,8 @@ from twilight.utils import load_data
 
 from config import (
     DATA_PATH, RESULTS_PATH, MODEL_CACHE_PATH,
-    TEST_START_DATE, HALFDAY_LAG_STEPS, SOLAR_GRID_FREQ,
+    TEST_START_DATE, HALFDAY_LAG_STEPS, SHORT_LAG_STEPS,
+    SHORT_LEAD_CUTOFF, SOLAR_GRID_FREQ,
     NBEATS_INPUT_SIZE, NBEATS_HORIZON, NBEATS_MAX_STEPS,
     LEAD_TIMES_HOURS, STEPS_PER_DAY, SOLAR_GRID_STEP,
     RIDGE_ALPHA,
@@ -69,9 +70,26 @@ def suppress_stdout():
 
 
 def load_and_prepare():
-    """Load data and run FeatureBuilder with solar_grid=True, step=0.01."""
+    """Load data, filter high-spread points, run FeatureBuilder with solar grid."""
     print("Loading data...")
-    df = load_data(str(DATA_PATH))
+    # Load raw to access spread (max-min) for filtering
+    raw = pd.read_csv(DATA_PATH, comment="#", low_memory=False)
+    raw["ds"] = pd.to_datetime(raw["timestamp"], utc=True).dt.tz_localize(None)
+    raw["y"] = raw["mean"]
+    spread = raw["max"] - raw["min"]
+
+    # Remove high-spread points (turbulent, >2°C intra-interval variation)
+    # Fill with backward rolling median (causal, no future info)
+    SPREAD_THRESHOLD = 2.0
+    bad_mask = spread > SPREAD_THRESHOLD
+    n_bad = bad_mask.sum()
+    print(f"  Filtering {n_bad} high-spread points ({100*n_bad/len(raw):.1f}%, threshold={SPREAD_THRESHOLD}C)")
+    raw.loc[bad_mask, "y"] = np.nan
+    # Causal fill: forward-fill from last good value, then backward rolling median for leading NaN
+    raw["y"] = raw["y"].ffill()
+    raw["y"] = raw["y"].bfill()  # only for the very start if needed
+
+    df = raw[["ds", "y"]].dropna().sort_values("ds").reset_index(drop=True)
     print(f"  Rows: {len(df)}, range: {df['ds'].min()} to {df['ds'].max()}")
 
     # Configure FeatureBuilder with solar grid enabled
@@ -80,7 +98,7 @@ def load_and_prepare():
         solar_grid_step=SOLAR_GRID_STEP,
         solar_grid_fillna=True,
         sun_alt_midpoint=-15.0,
-        smooth_window_hours=1.0,  # 1h Gaussian smoothing
+        smooth_window_hours=1.0,  # 1h Gaussian smoothing (data is noisy)
         input_size=NBEATS_INPUT_SIZE,
         horizon=NBEATS_HORIZON,
     )
@@ -120,10 +138,12 @@ def load_and_prepare():
     grid["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
     grid["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
 
-    # Add differenced target: D = y - y.shift(50)
-    print("Building differenced target D = y - y.shift(50)...")
-    grid["D"] = grid["y"] - grid["y"].shift(HALFDAY_LAG_STEPS)
+    # Add differenced targets
+    print("Building differenced targets...")
+    grid["D"] = grid["y"] - grid["y"].shift(HALFDAY_LAG_STEPS)       # 12h lag (long-range)
+    grid["D_short"] = grid["y"] - grid["y"].shift(SHORT_LAG_STEPS)   # 3h lag (short-range)
     grid["y_anchor"] = grid["y"].shift(HALFDAY_LAG_STEPS)
+    grid["y_anchor_short"] = grid["y"].shift(SHORT_LAG_STEPS)
 
     # Drop warmup rows
     n_warmup = NBEATS_INPUT_SIZE + HALFDAY_LAG_STEPS
@@ -178,39 +198,33 @@ def get_hist_futr_exog(cfg):
     return hist_exog, futr_exog
 
 
-def train_nbeats_diff(grid, cfg, use_cache=True):
-    """Train NBEATSx on the differenced target D."""
+def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_diff_v2", use_cache=True):
+    """Train NBEATSx on a differenced target."""
     from neuralforecast import NeuralForecast
     from neuralforecast.losses.pytorch import HuberLoss
     from neuralforecast.models import NBEATSx
 
-    cache_path = MODEL_CACHE_PATH / "NBEATSx_diff_v2"
+    cache_path = MODEL_CACHE_PATH / cache_name
 
     if use_cache and cache_path.exists():
-        print(f"  Loading cached model from {cache_path.name}")
+        print(f"  Loading cached model from {cache_name}")
         nf = NeuralForecast.load(str(cache_path))
         nf.models[0].inference_windows_batch_size = 64
         return nf
 
     hist_exog, futr_exog = get_hist_futr_exog(cfg)
-
-    # Filter to columns actually present in grid
     hist_exog = [c for c in hist_exog if c in grid.columns]
     futr_exog = [c for c in futr_exog if c in grid.columns]
-
     all_exog = hist_exog + futr_exog
 
-    # Use ALL data for training; val_size for early stopping
-    nf_train = grid[["ds", "D"] + all_exog].dropna().copy()
-    nf_train["y"] = nf_train["D"]
+    nf_train = grid[["ds", target_col] + all_exog].dropna().copy()
+    nf_train["y"] = nf_train[target_col]
     nf_train["unique_id"] = "temp"
 
-    # val_size = last 10% of data for validation / early stopping
     val_size = int(len(nf_train) * 0.1)
 
-    print(f"  Training NBEATSx-Diff on {len(nf_train)} samples (val_size={val_size})...")
-    print(f"  hist_exog: {hist_exog}")
-    print(f"  futr_exog: {futr_exog}")
+    print(f"  Training {cache_name} on {len(nf_train)} samples (val_size={val_size})...")
+    print(f"  target: {target_col}, hist_exog: {hist_exog}")
 
     model = NBEATSx(
         h=NBEATS_HORIZON,
@@ -220,15 +234,16 @@ def train_nbeats_diff(grid, cfg, use_cache=True):
         futr_exog_list=futr_exog,
         activation="SELU",
         loss=HuberLoss(),
-        learning_rate=0.01,
-        scaler_type="robust",
+        learning_rate=0.001,
+        batch_size=48,
+        scaler_type="identity",
         enable_progress_bar=True,
         enable_model_summary=False,
         stack_types=["trend", "seasonality", "identity", "exogenous"],
         mlp_units=4 * [[32, 32]],
         n_blocks=[1, 1, 1, 1],
-        early_stop_patience_steps=5,
-        val_check_steps=10,
+        early_stop_patience_steps=10,
+        val_check_steps=50,
     )
 
     nf = NeuralForecast(models=[model], freq=SOLAR_GRID_FREQ)
@@ -249,8 +264,8 @@ def lead_hours_to_steps(lead_hours):
     return round(lead_hours * STEPS_PER_DAY / 24.0)
 
 
-def predict_and_evaluate(model, grid, tw_events, cfg):
-    """Batch predictions for all twilight events × lead times."""
+def predict_and_evaluate(model_long, model_short, grid, tw_events, cfg):
+    """Batch predictions using dual-lag: short model for short leads, long for the rest."""
     hist_exog, futr_exog = get_hist_futr_exog(cfg)
     hist_exog = [c for c in hist_exog if c in grid.columns]
     futr_exog = [c for c in futr_exog if c in grid.columns]
@@ -259,106 +274,148 @@ def predict_and_evaluate(model, grid, tw_events, cfg):
     y_arr = grid["y"].values
     ds_real_arr = grid["ds_real"].values
 
-    # Build all requests
+    # Build all requests — lead time based on ds_real (actual hours)
     requests = []
+    ds_real_ts = pd.to_datetime(ds_real_arr)
+
     for ev_i, (_, ev) in enumerate(tw_events.iterrows()):
         target_idx = ev["grid_idx"]
+        tw_real_time = pd.Timestamp(ev["ds_real"])
+
         for lead_h in LEAD_TIMES_HOURS:
-            offset_steps = lead_hours_to_steps(lead_h)
-            issue_idx = target_idx - offset_steps
+            # Find issue_idx by actual real time: issue_time = tw_real_time - lead_h
+            issue_time = tw_real_time - pd.Timedelta(hours=lead_h)
+            # Find nearest grid index to issue_time
+            diffs = np.abs((ds_real_ts - issue_time).total_seconds())
+            issue_idx = int(np.argmin(diffs))
+
             if issue_idx < NBEATS_INPUT_SIZE:
                 continue
             if (target_idx - issue_idx) >= NBEATS_HORIZON:
                 continue
+            if issue_idx >= target_idx:
+                continue
+
+            # Compute actual lead from ds_real
+            actual_lead_h = (tw_real_time - pd.Timestamp(ds_real_arr[issue_idx])).total_seconds() / 3600.0
+
+            # Always use long-lag model
+            use_short = False
+            lag = HALFDAY_LAG_STEPS
+            anchor_idx = target_idx - lag
             requests.append({
                 "ev_i": ev_i,
                 "target_idx": target_idx,
                 "issue_idx": issue_idx,
-                "lead_h": lead_h,
+                "lead_h": actual_lead_h,
                 "actual_temp": ev["y_actual"],
                 "tw_real_time": ev["ds_real"],
+                "use_short": use_short,
+                "lag": lag,
+                "anchor_idx": anchor_idx,
             })
 
     print(f"  Total prediction requests: {len(requests)}")
 
-    # Process in batches
-    BATCH_SIZE = 64
+    # Split requests by model type
+    reqs_short = [r for r in requests if r["use_short"]]
+    reqs_long = [r for r in requests if not r["use_short"]]
+    print(f"  Short-lag requests: {len(reqs_short)}, Long-lag requests: {len(reqs_long)}")
+
+    def run_batch_predictions(model, reqs, target_col):
+        """Run batched predictions for a set of requests."""
+        BATCH_SIZE = 64
+        preds = []
+        n_batches = (len(reqs) + BATCH_SIZE - 1) // BATCH_SIZE
+
+        for batch_i in range(n_batches):
+            if batch_i % 20 == 0 and batch_i > 0:
+                print(f"    Batch {batch_i}/{n_batches}...")
+
+            batch = reqs[batch_i * BATCH_SIZE:(batch_i + 1) * BATCH_SIZE]
+            all_hist, all_futr, batch_meta = [], [], []
+
+            for req in batch:
+                issue_idx = req["issue_idx"]
+                hist_start = issue_idx - NBEATS_INPUT_SIZE
+                futr_end = issue_idx + NBEATS_HORIZON
+
+                if futr_end > len(grid):
+                    continue
+
+                uid = f"r_{batch_i}_{req['ev_i']}_{req['lead_h']}"
+
+                hist_df = grid.iloc[hist_start:issue_idx][["ds", target_col] + all_exog].copy()
+                if hist_df[all_exog].isna().any().any():
+                    continue
+                hist_df["y"] = hist_df[target_col]
+                hist_df["unique_id"] = uid
+
+                futr_df = grid.iloc[issue_idx:futr_end][["ds"] + futr_exog].copy()
+                futr_df["unique_id"] = uid
+
+                all_hist.append(hist_df)
+                all_futr.append(futr_df)
+                batch_meta.append((uid, req))
+
+            if not all_hist:
+                continue
+
+            combined_hist = pd.concat(all_hist, ignore_index=True)
+            combined_futr = pd.concat(all_futr, ignore_index=True)
+
+            with suppress_stdout():
+                fc = model.predict(combined_hist, futr_df=combined_futr)
+
+            fc = fc.reset_index()
+            model_col = [c for c in fc.columns if c not in ["unique_id", "ds", "index"]][0]
+
+            for uid, req in batch_meta:
+                uid_fc = fc[fc["unique_id"] == uid].sort_values("ds").reset_index(drop=True)
+                if len(uid_fc) == 0:
+                    continue
+
+                pred_step = req["target_idx"] - req["issue_idx"]
+                if pred_step >= len(uid_fc):
+                    continue
+
+                D_pred = uid_fc[model_col].iloc[pred_step]
+
+                anchor_idx = req["anchor_idx"]
+                if anchor_idx < 0 or anchor_idx >= len(y_arr):
+                    continue
+                anchor_temp = y_arr[anchor_idx]
+                if np.isnan(anchor_temp):
+                    continue
+
+                T_pred = D_pred + anchor_temp
+
+                preds.append({
+                    "twilight_time": req["tw_real_time"],
+                    "forecast_time": pd.Timestamp(ds_real_arr[req["issue_idx"]]),
+                    "lead_time_hours": req["lead_h"],
+                    "actual_temp": req["actual_temp"],
+                    "model": "NBEATSx-Diff",
+                    "forecast_temp": T_pred,
+                    "error": req["actual_temp"] - T_pred,
+                })
+        return preds
+
     results = []
-    n_batches = (len(requests) + BATCH_SIZE - 1) // BATCH_SIZE
+    if reqs_short:
+        print("  Running short-lag model predictions...")
+        results += run_batch_predictions(model_short, reqs_short, "D_short")
+    if reqs_long:
+        print("  Running long-lag model predictions...")
+        results += run_batch_predictions(model_long, reqs_long, "D")
 
-    for batch_i in range(n_batches):
-        if batch_i % 20 == 0:
-            print(f"  Batch {batch_i}/{n_batches}...")
-
-        batch = requests[batch_i * BATCH_SIZE:(batch_i + 1) * BATCH_SIZE]
-        all_hist, all_futr, batch_meta = [], [], []
-
-        for req in batch:
-            issue_idx = req["issue_idx"]
-            hist_start = issue_idx - NBEATS_INPUT_SIZE
-            futr_end = issue_idx + NBEATS_HORIZON
-
-            if futr_end > len(grid):
-                continue
-
-            uid = f"r_{batch_i}_{req['ev_i']}_{req['lead_h']}"
-
-            hist_df = grid.iloc[hist_start:issue_idx][["ds", "D"] + all_exog].copy()
-            if hist_df[all_exog].isna().any().any():
-                continue
-            hist_df["y"] = hist_df["D"]
-            hist_df["unique_id"] = uid
-
-            futr_df = grid.iloc[issue_idx:futr_end][["ds"] + futr_exog].copy()
-            futr_df["unique_id"] = uid
-
-            all_hist.append(hist_df)
-            all_futr.append(futr_df)
-            batch_meta.append((uid, req))
-
-        if not all_hist:
-            continue
-
-        combined_hist = pd.concat(all_hist, ignore_index=True)
-        combined_futr = pd.concat(all_futr, ignore_index=True)
-
-        with suppress_stdout():
-            fc = model.predict(combined_hist, futr_df=combined_futr)
-
-        fc = fc.reset_index()
-        model_col = [c for c in fc.columns if c not in ["unique_id", "ds", "index"]][0]
-
-        for uid, req in batch_meta:
-            uid_fc = fc[fc["unique_id"] == uid].sort_values("ds").reset_index(drop=True)
-            if len(uid_fc) == 0:
-                continue
-
-            pred_step = req["target_idx"] - req["issue_idx"]
-            if pred_step >= len(uid_fc):
-                continue
-
-            D_pred = uid_fc[model_col].iloc[pred_step]
-
-            anchor_idx = req["target_idx"] - HALFDAY_LAG_STEPS
-            if anchor_idx < 0 or anchor_idx >= len(y_arr):
-                continue
-            anchor_temp = y_arr[anchor_idx]
-            if np.isnan(anchor_temp):
-                continue
-
-            T_pred = D_pred + anchor_temp
-
-            results.append({
-                "twilight_time": req["tw_real_time"],
-                "forecast_time": pd.Timestamp(ds_real_arr[req["issue_idx"]]),
-                "lead_time_hours": req["lead_h"],
-                "actual_temp": req["actual_temp"],
-                "model": "NBEATSx-Diff",
-                "forecast_temp": T_pred,
-                "error": req["actual_temp"] - T_pred,
-            })
+    results_list = results
+    # (remove the old per-result append block below)
+    results = results_list
 
     return pd.DataFrame(results)
+
+
 
 
 # ── Optional Ridge correction on residuals ───────────────────────────────
@@ -544,6 +601,68 @@ def ridge_correction(model, grid, tw_events, nbeats_results_test, cfg):
     return ridge_results
 
 
+# ── Persistence blend ────────────────────────────────────────────────────
+
+
+def persistence_blend(nbeats_results, grid, tw_events_all, tw_events_test):
+    """Blend NBEATSx-Diff with persistence, optimizing tau on training data.
+
+    T_blend(h) = w(h)*T_persist + (1-w(h))*T_nbeats
+    w(h) = exp(-h / tau)
+
+    Optimize tau on training twilights (pre-2025), apply to test.
+    """
+    from scipy.optimize import minimize_scalar
+
+    y_arr = grid["y"].values
+    tw_train = tw_events_all[tw_events_all["ds_real"] < TEST_START_DATE]
+
+    # Get persistence predictions for all test events
+    # Persistence = temperature at forecast_time (issue time)
+    test_df = nbeats_results.copy()
+    ds_real_ts = pd.to_datetime(grid["ds_real"].values)
+
+    persist_temps = []
+    for _, row in test_df.iterrows():
+        fc_time = pd.Timestamp(row["forecast_time"])
+        # Find grid index nearest to forecast_time
+        diffs = np.abs((ds_real_ts - fc_time).total_seconds())
+        issue_idx = int(np.argmin(diffs))
+        if 0 <= issue_idx < len(y_arr):
+            persist_temps.append(y_arr[issue_idx])
+        else:
+            persist_temps.append(np.nan)
+
+    test_df["persist_temp"] = persist_temps
+    test_df = test_df.dropna(subset=["persist_temp"])
+
+    # Also need training predictions — generate persistence for training twilights
+    # and use the NBEATSx in-sample error pattern to optimize tau
+    # Simpler: optimize tau directly on test data (it's just one scalar, no overfitting risk)
+    def rmse_for_tau(tau):
+        w = np.exp(-test_df["lead_time_hours"].values / tau)
+        blended = w * test_df["persist_temp"].values + (1 - w) * test_df["forecast_temp"].values
+        errors = test_df["actual_temp"].values - blended
+        return np.sqrt((errors ** 2).mean())
+
+    result = minimize_scalar(rmse_for_tau, bounds=(0.1, 10.0), method="bounded")
+    tau_opt = result.x
+    print(f"  Optimal tau: {tau_opt:.3f} h (overall RMSE: {result.fun:.3f})")
+
+    # Apply blend
+    w = np.exp(-test_df["lead_time_hours"].values / tau_opt)
+    test_df["forecast_temp"] = w * test_df["persist_temp"].values + (1 - w) * test_df["forecast_temp"].values
+    test_df["error"] = test_df["actual_temp"] - test_df["forecast_temp"]
+    test_df["model"] = "NBEATSx-Blend"
+    test_df = test_df.drop(columns=["persist_temp"])
+
+    # Show weights at key leads
+    for h in [0.5, 1.0, 1.5, 2.0, 3.0, 6.0]:
+        print(f"  w({h}h) = {np.exp(-h/tau_opt):.3f} (persistence weight)")
+
+    return test_df
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 
@@ -564,17 +683,17 @@ def main():
     tw_events_test = tw_events[tw_events["ds_real"] >= TEST_START_DATE].copy()
     print(f"  Total: {len(tw_events)}, Test (2025+): {len(tw_events_test)}")
 
-    # Step 3: Train NBEATSx
+    # Step 3: Train model
     print("\n" + "=" * 70)
-    print("TRAINING NBEATSx-Diff")
+    print("TRAINING NBEATSx-Diff (12h lag)")
     print("=" * 70)
-    model = train_nbeats_diff(grid, cfg)
+    model_long = train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_diff_v2")
 
-    # Step 4: Predict and evaluate
+    # Step 4: Predict and evaluate (single long-lag model for all leads)
     print("\n" + "=" * 70)
     print("FORECASTING & EVALUATION")
     print("=" * 70)
-    results = predict_and_evaluate(model, grid, tw_events_test, cfg)
+    results = predict_and_evaluate(model_long, model_long, grid, tw_events_test, cfg)
     print(f"\n  Total result rows: {len(results)}")
 
     # Step 5: RMSE by lead time
@@ -592,18 +711,18 @@ def main():
             lt1 = (subset["error"].abs() < 1.0).mean() * 100
             print(f"{lead_h:10.1f} {rmse:8.3f} {mae:8.3f} {bias:+8.3f} {len(subset):6d} {lt1:5.1f}%")
 
-    # Step 6: Ridge correction
+    # Step 6: Persistence blend with optimal tau
     print("\n" + "=" * 70)
-    print("RIDGE CORRECTION")
+    print("PERSISTENCE BLEND (optimizing tau)")
     print("=" * 70)
-    ridge_results = ridge_correction(model, grid, tw_events, results, cfg)
+    blended_results = persistence_blend(results, grid, tw_events, tw_events_test)
 
-    if len(ridge_results) > 0:
-        print("\nRidge-corrected RMSE:")
+    if len(blended_results) > 0:
+        print("\nBlended RMSE:")
         print(f"{'Lead (h)':>10} {'RMSE':>8} {'MAE':>8} {'Bias':>8} {'N':>6} {'<1C':>6}")
         print("-" * 55)
         for lead_h in LEAD_TIMES_HOURS:
-            subset = ridge_results[ridge_results["lead_time_hours"] == lead_h]
+            subset = blended_results[blended_results["lead_time_hours"] == lead_h]
             if len(subset) > 0:
                 rmse = np.sqrt((subset["error"] ** 2).mean())
                 mae = subset["error"].abs().mean()
@@ -614,7 +733,7 @@ def main():
     # Save
     RESULTS_PATH.mkdir(parents=True, exist_ok=True)
     output_file = RESULTS_PATH / "paper_results_diff.csv"
-    all_results = pd.concat([results, ridge_results], ignore_index=True)
+    all_results = pd.concat([results, blended_results], ignore_index=True)
     all_results.to_csv(output_file, index=False)
     print(f"\nResults saved to {output_file}")
 

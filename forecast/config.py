@@ -17,18 +17,20 @@ TEST_START_DATE = pd.Timestamp("2025-01-01")
 # Solar grid
 SOLAR_GRID_STEP = 1.0 / 48.0  # 48 points per solar day (30-min equivalent)
 STEPS_PER_DAY = 48
-HALFDAY_LAG_STEPS = 24        # 0.5 solar days = target differencing lag
+HALFDAY_LAG_STEPS = 24        # 0.5 solar days = target differencing lag (long-range model)
+SHORT_LAG_STEPS = 6           # 3h lag = 6 steps (short-range model)
+SHORT_LEAD_CUTOFF = 1.5       # hours: use short-lag model below this lead time
 
 # Synthetic clock: step * 24h = 0.5h = 1800s per grid step
 SOLAR_GRID_FREQ = "1800s"
 
 # NBEATSx model
 NBEATS_INPUT_SIZE = 48        # 1 solar day lookback
-NBEATS_HORIZON = 24           # 0.5 solar day ahead (~12h)
+NBEATS_HORIZON = 26           # slightly > 12h to cover all lead times
 NBEATS_MAX_STEPS = 500
 
-# Evaluation (max 6h lead)
-LEAD_TIMES_HOURS = list(np.arange(0.5, 6.5, 0.5))
+# Evaluation (max 12h lead)
+LEAD_TIMES_HOURS = list(np.arange(0.5, 12.5, 0.5))
 
 # Ridge correction
 RIDGE_ALPHA = 1.0
