@@ -218,3 +218,4 @@ results/
 *.out
 *.synctex.gz
 texput.log
+docs/spie_paper.pdf
