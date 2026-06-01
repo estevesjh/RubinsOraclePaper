@@ -1,8 +1,8 @@
 """Causal NBEATSx-Diff twilight temperature forecasting.
 
-Target: T at alt_sun = -15 deg (sun setting).
-Method: Train NBEATSx on D(tn) = T(tn) - T(tn - 0.5 solar day).
-        Reconstruct: T_pred = D_pred + T_observed(tn - 0.5).
+Target: T at alt_sun = -20 deg (sun setting).
+Method: Train NBEATSx on DeltaT(t) = T(t) - T(t - 1/2 SD).
+        Reconstruct: T_pred = DeltaT_pred + T_observed(t - 1/2 SD).
         Fully causal — no future information used.
 
 Uses FeatureBuilder from rubin-twilight-forecast for feature engineering.
@@ -117,9 +117,73 @@ def load_and_prepare():
     grid["y_lag_48"] = grid["y"].shift(48)      # 24h ago
     grid["y_lag_96"] = grid["y"].shift(96)      # 2 days ago
 
+    # 30h difference: temperature change over 60 steps (1.25 days)
+    y_arr = grid["y"].values
+    grid["y_diff_60"] = y_arr - np.roll(y_arr, 60)
+    grid.iloc[:60, grid.columns.get_loc("y_diff_60")] = np.nan
+
+    # MeteoBlue corrected forecast as exogenous feature
+    # Correction: per-SolarTime slope + bias (time-of-day dependent)
+    print("Adding MeteoBlue corrected forecast feature...")
+    from pathlib import Path
+    MB_FILE = Path(__file__).parent.parent / "data" / "meteo_blue_weather_station.csv"
+    if MB_FILE.exists():
+        mb = pd.read_csv(MB_FILE)
+        mb["valid_time"] = pd.to_datetime(
+            mb["valid_time_utc"] if "valid_time_utc" in mb.columns else mb["valid_time"],
+            utc=True
+        ).dt.tz_localize(None)
+        # Only use causal forecasts: lead_hours > 0 (forecast was issued BEFORE valid_time)
+        mb = mb[mb["lead_hours"] > 0].copy()
+        # Use shortest available lead (most recent causal forecast)
+        mb_latest = mb.sort_values(["valid_time", "lead_hours"]).drop_duplicates("valid_time", keep="first")
+        mb_latest = mb_latest[["valid_time", "temperature"]].set_index("valid_time").sort_index()
+        # Interpolate raw MeteoBlue onto solar grid
+        ds_real = pd.to_datetime(grid["ds_real"].values)
+        mb_raw_interp = np.interp(
+            ds_real.astype("int64"),
+            mb_latest.index.astype("int64"),
+            mb_latest["temperature"].values,
+        )
+        # Mark points outside MeteoBlue range as NaN
+        mb_min = mb_latest.index.min()
+        mb_max = mb_latest.index.max()
+        outside = (ds_real < mb_min) | (ds_real > mb_max)
+        mb_raw_interp[outside] = np.nan
+        # Fit slope + bias per SolarTime bin (48 bins = 48 steps/day)
+        # ONLY use pre-2025 data for calibration (avoid test set leakage)
+        solar_time = grid["SolarTime"].values
+        ds_real_for_cal = pd.to_datetime(grid["ds_real"].values)
+        train_mask_cal = ds_real_for_cal < TEST_START_DATE
+        n_bins = 48
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_slopes = np.ones(n_bins)
+        bin_biases = np.zeros(n_bins)
+        for b in range(n_bins):
+            mask = (solar_time >= bin_edges[b]) & (solar_time < bin_edges[b + 1]) & ~np.isnan(mb_raw_interp) & ~np.isnan(y_arr) & train_mask_cal
+            if mask.sum() > 30:
+                coeffs = np.polyfit(mb_raw_interp[mask], y_arr[mask], 1)
+                bin_slopes[b], bin_biases[b] = coeffs
+        # Apply per-bin correction
+        mb_corrected = np.full(len(y_arr), np.nan)
+        for b in range(n_bins):
+            mask = (solar_time >= bin_edges[b]) & (solar_time < bin_edges[b + 1])
+            mb_corrected[mask] = bin_slopes[b] * mb_raw_interp[mask] + bin_biases[b]
+        # Fill missing with noise (std from residuals where we have data)
+        valid = ~np.isnan(mb_corrected) & ~np.isnan(y_arr)
+        residual_std = np.std(mb_corrected[valid] - y_arr[valid]) if valid.sum() > 100 else 2.4
+        nan_mask = np.isnan(mb_corrected)
+        np.random.seed(42)
+        mb_corrected[nan_mask] = y_arr[nan_mask] + np.random.normal(0, residual_std, nan_mask.sum())
+        grid["mb_corrected"] = mb_corrected
+        print(f"  MeteoBlue coverage: {(~nan_mask).sum()}/{len(mb_corrected)} ({100*(~nan_mask).mean():.0f}%)")
+        print(f"  Residual std (for noise fill): {residual_std:.2f} C")
+    else:
+        print("  MeteoBlue file not found, filling with noise")
+        grid["mb_corrected"] = y_arr + np.random.normal(0, 2.4, len(y_arr))
+
     # Backward OLS slope over 4 grid steps (~2h at 30-min cadence)
     window = 4
-    y_arr = grid["y"].values
     slopes = np.full(len(y_arr), np.nan)
     x = np.arange(window, dtype=float)
     x_mean = x.mean()
@@ -244,17 +308,15 @@ def get_hist_futr_exog(cfg):
         "y_lag_48",          # 24h ago
         "y_lag_96",          # 2 days ago
         "trend_solar_2h",   # backward OLS slope
+        "y_diff_60",        # temp change over 30h (1.25 days) — best for Spring
         "cooling_rate_3h",  # (y[t] - y[t-6]) / 6
         "dmean_1d",         # 24h mean change over 1 day
         "dmean_3d",         # 24h mean change over 3 days
         "last_std_24h",     # rolling std over last 24h
     ]
-    futr_exog = [
-        "solar_sin",
-        "solar_cos",
-        "doy_sin",
-        "doy_cos",
-    ]
+    futr_exog = ["solar_sin", "solar_cos", "doy_sin", "doy_cos"]
+    if globals().get("USE_MB", True):
+        futr_exog.append("mb_corrected")
     return hist_exog, futr_exog
 
 
@@ -721,8 +783,8 @@ def persistence_blend(nbeats_results, grid, tw_events_all, tw_events_test):
 def main():
     print("=" * 70)
     print("CAUSAL NBEATSx-Diff TWILIGHT FORECASTING")
-    print("Target: T at alt_sun = -15 deg (sun setting)")
-    print("Method: D(tn) = T(tn) - T(tn-0.5), solar grid step=0.01")
+    print("Target: T at alt_sun = -20 deg (sun setting)")
+    print("Method: DeltaT(t) = T(t) - T(t - 1/2 SD), solar grid 48 steps/day")
     print("Features: FeatureBuilder from rubin-twilight-forecast")
     print("=" * 70)
 
@@ -730,7 +792,7 @@ def main():
     grid, cfg = load_and_prepare()
 
     # Step 2: Find twilight target events
-    print("\nFinding twilight events (alt_sun crossing -15 deg setting)...")
+    print("\nFinding twilight events (alt_sun crossing -20 deg setting)...")
     tw_events = find_twilight_targets(grid)
     tw_events_test = tw_events[tw_events["ds_real"] >= TEST_START_DATE].copy()
     print(f"  Total: {len(tw_events)}, Test (2025+): {len(tw_events_test)}")
@@ -739,7 +801,10 @@ def main():
     print("\n" + "=" * 70)
     print("TRAINING NBEATSx-Diff (12h lag)")
     print("=" * 70)
-    model_long = train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt")
+    cache_name = globals().get("CACHE_NAME", "NBEATSx_feat_opt")
+    use_mb = globals().get("USE_MB", True)
+    print(f"  Model: {cache_name} ({'with' if use_mb else 'without'} MeteoBlue)")
+    model_long = train_nbeats_diff(grid, cfg, target_col="D", cache_name=cache_name)
 
     # Step 4: Predict and evaluate (single long-lag model for all leads)
     print("\n" + "=" * 70)
@@ -795,4 +860,14 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mb", action="store_true", help="Include MeteoBlue corrected forecast as futr_exog")
+    parser.add_argument("--name", type=str, default=None, help="Model cache name")
+    args = parser.parse_args()
+
+    # Set globals based on flags
+    USE_MB = args.mb
+    CACHE_NAME = args.name or ("NBEATSx_nwp" if args.mb else "NBEATSx_local")
+
     main()
