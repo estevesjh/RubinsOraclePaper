@@ -1276,8 +1276,8 @@ def fig8_comparison_nbeats_prophet_meteoblue():
     )
 
     datasets = [
-        (nbeats_df, "NBEATSx-Blend (6h)", colors["NBEATSx-Ridge"]),
-        (prophet_df, "Prophet (6h)", colors["Prophet"]),
+        (nbeats_df, "NBEATSx-Blend (mid-day)", colors["NBEATSx-Ridge"]),
+        (prophet_df, "Prophet (mid-day)", colors["Prophet"]),
         (meteoblue_df, "MeteoBlue", colors["MeteoBlue"]),
     ]
 

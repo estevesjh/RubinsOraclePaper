@@ -135,18 +135,18 @@ def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
 
         for _, tw_row in twilight_events.iterrows():
             tw_time = tw_row["twilight_time"]
+            actual_temp = tw_row["actual_temp"]  # use same target as other models
             tw_ns = tw_time.value
 
             # Check if twilight is within Prophet's valid range
             if tw_ns < vt_ns[0] or tw_ns > vt_ns[-1]:
                 continue
 
-            # Interpolate y_hat and y to exact twilight time
+            # Interpolate y_hat to exact twilight time
             forecast_temp = float(np.interp(tw_ns, vt_ns, yhat_arr))
-            actual_temp = float(np.interp(tw_ns, vt_ns, y_arr))
-            error = forecast_temp - actual_temp
+            error = actual_temp - forecast_temp
 
-            if np.abs(error) > 10.0:
+            if np.abs(error) > 5.0:
                 continue
 
             results.append({
@@ -186,8 +186,7 @@ def process_meteoblue_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
 
     target_rows = []
     for i, tw_utc in enumerate(tw_times):
-        for offset_h in range(2):  # twilight + 0h and +1h only
-            target_rows.append((tw_utc + pd.Timedelta(hours=offset_h), actuals[i], tw_times.iloc[i]))
+        target_rows.append((tw_utc, actuals[i], tw_times.iloc[i]))  # twilight only
     target_times = pd.DatetimeIndex([r[0] for r in target_rows])
     target_actuals = np.array([r[1] for r in target_rows])
     target_tw_times = [r[2] for r in target_rows]

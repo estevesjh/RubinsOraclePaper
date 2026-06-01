@@ -58,8 +58,10 @@ def main():
     ds_real_arr = grid["ds_real"].values
     print(f"   Test twilights: {len(tw_test)}")
 
-    # 3. Persistence (temperature at forecast issuance time)
-    print("\n3. Persistence...")
+    # 3. Persistence: T_forecast = T(now) + DeltaT_yesterday(twilight - now)
+    # For each lead time h, issue_idx is "now". We look at yesterday's change
+    # from the same solar position to twilight, and add that to today's T(now).
+    print("\n3. Persistence (T(now) + yesterday's DeltaT(twilight-now))...")
     persist_rows = []
     for _, ev in tw_test.iterrows():
         target_idx = ev["grid_idx"]
@@ -68,14 +70,30 @@ def main():
             issue_idx = target_idx - offset
             if issue_idx < 0 or issue_idx >= len(y_arr):
                 continue
+            # T(now)
+            T_now = y_arr[issue_idx]
+            # Yesterday at the same position: issue_idx - 48
+            issue_yesterday_idx = issue_idx - STEPS_PER_DAY
+            # Yesterday's twilight: target_idx - 48
+            twilight_yesterday_idx = target_idx - STEPS_PER_DAY
+            if issue_yesterday_idx < 0 or twilight_yesterday_idx < 0:
+                continue
+            T_now_yesterday = y_arr[issue_yesterday_idx]
+            T_twilight_yesterday = y_arr[twilight_yesterday_idx]
+            if any(np.isnan(v) for v in [T_now, T_now_yesterday, T_twilight_yesterday]):
+                continue
+            # Yesterday's change from this time to twilight
+            delta_T_yesterday = T_twilight_yesterday - T_now_yesterday
+            persist_temp = T_now + delta_T_yesterday
+
             persist_rows.append({
                 "twilight_time": pd.Timestamp(ev["ds_real"]).strftime("%Y-%m-%d %H:%M:%S.000"),
                 "forecast_time": pd.Timestamp(ds_real_arr[issue_idx]).strftime("%Y-%m-%d %H:%M:%S.000"),
                 "lead_time_hours": lead_h,
                 "actual_temp": ev["y_actual"],
                 "model": "Persistence",
-                "forecast_temp": y_arr[issue_idx],
-                "error": ev["y_actual"] - y_arr[issue_idx],
+                "forecast_temp": persist_temp,
+                "error": ev["y_actual"] - persist_temp,
             })
     persist_df = pd.DataFrame(persist_rows)
     print(f"   {len(persist_df)} rows")
