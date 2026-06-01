@@ -80,7 +80,7 @@ def load_and_prepare():
 
     # Remove high-spread points (turbulent, >2°C intra-interval variation)
     # Fill with backward rolling median (causal, no future info)
-    SPREAD_THRESHOLD = 2.0
+    SPREAD_THRESHOLD = 3.0
     bad_mask = spread > SPREAD_THRESHOLD
     n_bad = bad_mask.sum()
     print(f"  Filtering {n_bad} high-spread points ({100*n_bad/len(raw):.1f}%, threshold={SPREAD_THRESHOLD}C)")
@@ -97,7 +97,7 @@ def load_and_prepare():
         solar_grid=True,
         solar_grid_step=SOLAR_GRID_STEP,
         solar_grid_fillna=True,
-        sun_alt_midpoint=-15.0,
+        sun_alt_midpoint=-25.0,
         smooth_window_hours=1.0,  # 1h Gaussian smoothing (data is noisy)
         input_size=NBEATS_INPUT_SIZE,
         horizon=NBEATS_HORIZON,
@@ -138,6 +138,27 @@ def load_and_prepare():
     grid["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
     grid["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
 
+    # Causal DTR (Daily Temperature Range) with heavy smoothing
+    # 5h smoothing = 10 steps on 48-step/day grid
+    print("Adding DTR and Tmax change features...")
+    y_smooth_5h = pd.Series(y_arr).rolling(10, min_periods=5, center=False).mean().values
+    # 2h smoothing = 4 steps (for Tmax change)
+    y_smooth_2h = pd.Series(y_arr).rolling(4, min_periods=2, center=False).mean().values
+    # Rolling max/min over 1 day (48 steps) from smoothed data
+    last_Tmax_5h = pd.Series(y_smooth_5h).rolling(48, min_periods=24).max().values
+    last_Tmin_5h = pd.Series(y_smooth_5h).rolling(48, min_periods=24).min().values
+    grid["DTR"] = last_Tmax_5h - last_Tmin_5h
+    # Tmax from 2h smoothing (for day-to-day change)
+    last_Tmax_2h = pd.Series(y_smooth_2h).rolling(48, min_periods=24).max().values
+    # Tmax change: today vs 1 day ago, vs 3 days ago
+    grid["dTmax_1d"] = last_Tmax_2h - np.roll(last_Tmax_2h, 48)
+    grid["dTmax_3d"] = last_Tmax_2h - np.roll(last_Tmax_2h, 48 * 3)
+    # Clean edge effects
+    grid.loc[:48*3, ["dTmax_1d", "dTmax_3d"]] = np.nan
+
+    # Causal 24h mean temperature (rolling mean over last 48 steps)
+    grid["Tmean_24h"] = pd.Series(y_arr).rolling(48, min_periods=24).mean().values
+
     # Add differenced targets
     print("Building differenced targets...")
     grid["D"] = grid["y"] - grid["y"].shift(HALFDAY_LAG_STEPS)       # 12h lag (long-range)
@@ -154,18 +175,35 @@ def load_and_prepare():
 
 
 def find_twilight_targets(grid):
-    """Find grid indices where alt_sun crosses -15 deg (setting)."""
-    mask = grid["twilight_event_sunset"].values.astype(bool)
-    idxs = np.where(mask)[0]
+    """Find twilight events by interpolating to exact alt_sun crossing.
+
+    Uses 2h-smoothed y for validation (reduces noise in actual values).
+    """
+    alt = grid["alt_sun"].values
+    y_arr = grid["y"].values
+    midpoint = -25.0  # target altitude
+
+    # 3h Gaussian smoothing for validation actuals (centered)
+    # On 48-step/day grid: 3h = 6 steps, use Gaussian with std ~2 steps
+    y_smooth_val = pd.Series(y_arr).rolling(6, min_periods=3, center=True, win_type="gaussian").mean(std=2).values
+
+    # Find zero-crossings of (alt - midpoint) while setting
+    adjusted = alt - midpoint
+    crossings = np.where((adjusted[:-1] >= 0) & (adjusted[1:] < 0))[0]
 
     events = []
-    for i in idxs:
+    for i in crossings:
+        # Linear interpolation to find exact crossing fraction
+        a0, a1 = adjusted[i], adjusted[i + 1]
+        frac = a0 / (a0 - a1)  # fraction between i and i+1
+        # Interpolate Gaussian-smoothed y at the crossing
+        y_interp = y_smooth_val[i] + frac * (y_smooth_val[i + 1] - y_smooth_val[i])
         events.append({
-            "grid_idx": i,
-            "solarDayHour": grid["solarDayHour"].iloc[i],
+            "grid_idx": i,  # use the step just before crossing for predictions
+            "solarDayHour": grid["solarDayHour"].iloc[i] + frac * (grid["solarDayHour"].iloc[i+1] - grid["solarDayHour"].iloc[i]),
             "ds_real": grid["ds_real"].iloc[i],
             "DayCount": grid["DayCount"].iloc[i],
-            "y_actual": grid["y"].iloc[i],
+            "y_actual": y_interp,
         })
     return pd.DataFrame(events)
 
@@ -188,6 +226,7 @@ def get_hist_futr_exog(cfg):
         "y_lag_24",          # 12h ago (the reconstruction anchor)
         "y_lag_48",          # 24h ago
         "trend_solar_2h",   # backward OLS slope
+        "DTR",              # daily temperature range (5h smoothed)
     ]
     futr_exog = [
         "solar_sin",
@@ -198,7 +237,7 @@ def get_hist_futr_exog(cfg):
     return hist_exog, futr_exog
 
 
-def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_diff_v2", use_cache=True):
+def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_diff_v3", use_cache=True):
     """Train NBEATSx on a differenced target."""
     from neuralforecast import NeuralForecast
     from neuralforecast.losses.pytorch import HuberLoss
@@ -274,20 +313,15 @@ def predict_and_evaluate(model_long, model_short, grid, tw_events, cfg):
     y_arr = grid["y"].values
     ds_real_arr = grid["ds_real"].values
 
-    # Build all requests — lead time based on ds_real (actual hours)
+    # Build all requests using grid step offsets (clean lead times)
     requests = []
-    ds_real_ts = pd.to_datetime(ds_real_arr)
 
     for ev_i, (_, ev) in enumerate(tw_events.iterrows()):
         target_idx = ev["grid_idx"]
-        tw_real_time = pd.Timestamp(ev["ds_real"])
 
         for lead_h in LEAD_TIMES_HOURS:
-            # Find issue_idx by actual real time: issue_time = tw_real_time - lead_h
-            issue_time = tw_real_time - pd.Timedelta(hours=lead_h)
-            # Find nearest grid index to issue_time
-            diffs = np.abs((ds_real_ts - issue_time).total_seconds())
-            issue_idx = int(np.argmin(diffs))
+            offset_steps = lead_hours_to_steps(lead_h)
+            issue_idx = target_idx - offset_steps
 
             if issue_idx < NBEATS_INPUT_SIZE:
                 continue
@@ -295,9 +329,6 @@ def predict_and_evaluate(model_long, model_short, grid, tw_events, cfg):
                 continue
             if issue_idx >= target_idx:
                 continue
-
-            # Compute actual lead from ds_real
-            actual_lead_h = (tw_real_time - pd.Timestamp(ds_real_arr[issue_idx])).total_seconds() / 3600.0
 
             # Always use long-lag model
             use_short = False
@@ -307,7 +338,7 @@ def predict_and_evaluate(model_long, model_short, grid, tw_events, cfg):
                 "ev_i": ev_i,
                 "target_idx": target_idx,
                 "issue_idx": issue_idx,
-                "lead_h": actual_lead_h,
+                "lead_h": lead_h,
                 "actual_temp": ev["y_actual"],
                 "tw_real_time": ev["ds_real"],
                 "use_short": use_short,

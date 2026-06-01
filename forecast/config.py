@@ -26,7 +26,7 @@ SOLAR_GRID_FREQ = "1800s"
 
 # NBEATSx model
 NBEATS_INPUT_SIZE = 48        # 1 solar day lookback
-NBEATS_HORIZON = 26           # slightly > 12h to cover all lead times
+NBEATS_HORIZON = 26           # >12h to ensure 12h lead is covered
 NBEATS_MAX_STEPS = 500
 
 # Evaluation (max 12h lead)

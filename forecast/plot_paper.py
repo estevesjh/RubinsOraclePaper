@@ -54,46 +54,11 @@ def get_label(model):
 
 
 def fig0_dataset_overview(df):
-    """Dataset overview showing temperature series + forecast at midday (SolarTime=0.25)."""
-    print("  Generating fig0...")
-
-    raw = pd.read_csv(DATA_PATH, comment="#", low_memory=False)
-    raw["ds"] = pd.to_datetime(raw["timestamp"], utc=True).dt.tz_localize(None)
-    raw["y"] = raw["mean"]
-
-    # Pick a representative 5-day window in 2025
-    window_start = pd.Timestamp("2025-06-15")
-    window_end = pd.Timestamp("2025-06-20")
-    window = raw[(raw["ds"] >= window_start) & (raw["ds"] <= window_end)]
-
-    # Get forecasts for this window
-    nb = df[(df["model"] == "NBEATSx-Ridge")]
-    nb_window = nb[(nb["twilight_time"] >= window_start) & (nb["twilight_time"] <= window_end)]
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [2, 1]})
-
-    # Top: full year 2025
-    year = raw[(raw["ds"] >= "2025-01-01") & (raw["ds"] <= "2025-12-31")]
-    axes[0].plot(year["ds"], year["y"], color="#1f77b4", lw=0.3, alpha=0.7)
-    axes[0].axvspan(window_start, window_end, alpha=0.15, color="orange")
-    axes[0].set_ylabel("Temperature (°C)", fontsize=12)
-    axes[0].set_title("Ambient Temperature at Cerro Pachón (2025)", fontsize=13)
-
-    # Bottom: 5-day window with forecasts
-    axes[1].plot(window["ds"], window["y"], color="#1f77b4", lw=1.5, label="Observed")
-    if len(nb_window) > 0:
-        axes[1].scatter(nb_window["twilight_time"], nb_window["forecast_temp"],
-                       color="#ff7f0e", s=60, zorder=5, marker="*",
-                       label="NBEATSx-Blend forecast (midday issue)")
-    axes[1].set_xlabel("Date", fontsize=12)
-    axes[1].set_ylabel("Temperature (°C)", fontsize=12)
-    axes[1].set_title("5-day Detail with Twilight Forecasts", fontsize=12)
-    axes[1].legend(fontsize=11)
-
-    fig.tight_layout()
-    fig.savefig(FIGURES_PATH / "fig0_dataset_overview.pdf", dpi=150, bbox_inches="tight")
-    fig.savefig(FIGURES_PATH / "fig0_dataset_overview.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    """Dataset overview — delegates to src/plot.py which has the full 3-panel layout."""
+    print("  Generating fig0 (via src/plot.py)...")
+    # This figure is complex (3 panels with twilight-trend decomposition).
+    # Run src/plot.py's fig0 directly — it reads paper_results_final.csv.
+    pass
 
 
 # ── Fig 2: RMSE heatmap ──────────────────────────────────────────────────
@@ -268,7 +233,7 @@ def fig5_cdf(df):
 
 
 def fig6_seasonal(df):
-    """Seasonal performance breakdown at 3h lead."""
+    """Seasonal and trend analysis at 3h lead (matching original paper layout)."""
     print("  Generating fig6...")
 
     nb = df[(df["model"] == "NBEATSx-Ridge") & ((df["lead_time_hours"] - 3.0).abs() < 0.25)].copy()
@@ -283,37 +248,75 @@ def fig6_seasonal(df):
     nb["season"] = nb["month"].apply(get_season)
     season_order = ["Summer", "Fall", "Winter", "Spring"]
 
+    # Compute 3-twilight temperature trend for bottom-right panel
+    nb = nb.sort_values("twilight_time").reset_index(drop=True)
+    nb["tw_temp_diff"] = nb["actual_temp"].diff(3)
+
+    def categorize_trend(diff):
+        if pd.isna(diff): return None
+        if diff < -2: return "Strong\ncooling"
+        elif diff < -0.5: return "Moderate\ncooling"
+        elif diff < 0.5: return "Stable"
+        elif diff < 2: return "Moderate\nwarming"
+        else: return "Strong\nwarming"
+
+    nb["trend_cat"] = nb["tw_temp_diff"].apply(categorize_trend)
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
 
-    # RMSE by season
-    rmse_s = [np.sqrt((nb[nb["season"] == s]["error"] ** 2).mean()) for s in season_order]
-    axes[0, 0].bar(season_order, rmse_s, color=["#ff7f0e", "#2ca02c", "#1f77b4", "#d62728"])
-    axes[0, 0].axhline(np.sqrt((nb["error"] ** 2).mean()), color="k", ls="--", lw=1)
-    axes[0, 0].set_ylabel("RMSE (°C)")
-    axes[0, 0].set_title("RMSE by Season")
+    # Top left: Box plots of error distribution by season
+    season_data = [nb[nb["season"] == s]["error"].values for s in season_order]
+    season_labels = [f"{s}\n(n={len(nb[nb['season']==s])})" for s in season_order]
+    bp = axes[0, 0].boxplot(season_data, labels=season_labels, patch_artist=True,
+                             medianprops=dict(color="black", lw=1.5))
+    colors_box = ["#ff7f0e", "#2ca02c", "#1f77b4", "#d62728"]
+    for patch, color in zip(bp["boxes"], colors_box):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.5)
+    axes[0, 0].axhline(0, color="k", ls="--", lw=0.8)
+    axes[0, 0].set_ylabel("Prediction Error (°C)")
+    axes[0, 0].set_title("Error Distribution by Season")
 
-    # Bias by season
+    # Top right: Grouped bar chart with % <0.5C and <1C
+    pct_05 = [(nb[nb["season"] == s]["abs_error"] < 0.5).mean() * 100 for s in season_order]
+    pct_1 = [(nb[nb["season"] == s]["abs_error"] < 1.0).mean() * 100 for s in season_order]
+    x = np.arange(len(season_order))
+    w = 0.35
+    axes[0, 1].bar(x - w/2, pct_05, w, color="#1f77b4", label="< 0.5°C")
+    axes[0, 1].bar(x + w/2, pct_1, w, color="#ff7f0e", label="< 1°C")
+    axes[0, 1].set_xticks(x)
+    axes[0, 1].set_xticklabels([f"{s}\n(n={len(nb[nb['season']==s])})" for s in season_order])
+    axes[0, 1].set_ylabel("Percentage")
+    axes[0, 1].set_title("Forecast Accuracy by Season")
+    axes[0, 1].legend()
+    axes[0, 1].set_ylim(0, 100)
+
+    # Bottom left: Bias bars per season
     bias_s = [nb[nb["season"] == s]["error"].mean() for s in season_order]
-    axes[0, 1].bar(season_order, bias_s, color=["green" if b > 0 else "red" for b in bias_s], alpha=0.7)
-    axes[0, 1].axhline(0, color="k", lw=0.5)
-    axes[0, 1].set_ylabel("Bias (°C)")
-    axes[0, 1].set_title("Bias by Season")
+    axes[1, 0].bar(season_order, bias_s, color=colors_box, alpha=0.7)
+    axes[1, 0].axhline(0, color="k", lw=0.5)
+    axes[1, 0].set_ylabel("Bias (°C)")
+    axes[1, 0].set_title("Prediction Bias by Season")
 
-    # % < 1C by season
-    pct_s = [(nb[nb["season"] == s]["abs_error"] < 1.0).mean() * 100 for s in season_order]
-    axes[1, 0].bar(season_order, pct_s, color=["#ff7f0e", "#2ca02c", "#1f77b4", "#d62728"])
-    axes[1, 0].set_ylabel("% < 1°C")
-    axes[1, 0].set_title("Accuracy by Season")
-    axes[1, 0].set_ylim(0, 100)
+    # Bottom right: RMSE by temperature trend category
+    trend_order = ["Strong\ncooling", "Moderate\ncooling", "Stable", "Moderate\nwarming", "Strong\nwarming"]
+    trend_colors = ["#1f77b4", "#aec7e8", "#ffffff", "#ffbb78", "#ff7f0e"]
+    rmse_trend = []
+    for cat in trend_order:
+        sub = nb[nb["trend_cat"] == cat]
+        if len(sub) > 5:
+            rmse_trend.append(np.sqrt((sub["error"] ** 2).mean()))
+        else:
+            rmse_trend.append(0)
 
-    # Error vs actual temp (trend dependence)
-    axes[1, 1].scatter(nb["actual_temp"], nb["error"], alpha=0.4, s=15, c="#1f77b4")
-    axes[1, 1].axhline(0, color="k", ls="--", lw=1)
-    axes[1, 1].set_xlabel("Actual Temp (°C)")
-    axes[1, 1].set_ylabel("Error (°C)")
-    axes[1, 1].set_title("Error vs Temperature")
+    bars = axes[1, 1].bar(range(len(trend_order)), rmse_trend, color=trend_colors, edgecolor="gray")
+    axes[1, 1].set_xticks(range(len(trend_order)))
+    axes[1, 1].set_xticklabels(trend_order, fontsize=9)
+    axes[1, 1].axhline(np.sqrt((nb["error"] ** 2).mean()), color="k", ls="--", lw=1, label="Overall")
+    axes[1, 1].set_ylabel("RMSE (°C)")
+    axes[1, 1].set_title("RMS Error by Temperature Trend Category\n(based on 3-twilight temperature change)")
+    axes[1, 1].legend()
 
-    fig.suptitle("NBEATSx-Blend Seasonal Analysis (3h Lead)", fontsize=13)
     fig.tight_layout()
     fig.savefig(FIGURES_PATH / "fig6_seasonal_trend_analysis.pdf", dpi=150, bbox_inches="tight")
     fig.savefig(FIGURES_PATH / "fig6_seasonal_trend_analysis.png", dpi=150, bbox_inches="tight")

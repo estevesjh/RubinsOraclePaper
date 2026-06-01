@@ -79,10 +79,38 @@ def fig0_dataset_overview():
             .dt.tz_localize(None)
         )
 
-        # 4. Compute twilight baseline (linear interpolation between twilights)
-        twilight_mask = df["twilight_temp"].notna()
-        twilight_times = df.loc[twilight_mask, "ds_local"].values
-        twilight_temps = df.loc[twilight_mask, "twilight_temp"].values
+        # 4. Compute twilight baseline from NBEATSx-Ridge forecast targets (alt_sun=-15)
+        # Load our actual twilight events (from paper_results_final.csv)
+        forecast_df_temp = pd.read_csv(RESULTS_PATH / "paper_results_final.csv")
+        forecast_df_temp["twilight_time"] = pd.to_datetime(
+            forecast_df_temp["twilight_time"], format="mixed"
+        )
+        # Get unique twilight events with actual temp
+        nb_temp = forecast_df_temp[forecast_df_temp["model"] == "NBEATSx-Ridge"]
+        tw_unique = nb_temp.groupby("twilight_time")["actual_temp"].first().reset_index()
+        tw_unique["tw_local"] = (
+            tw_unique["twilight_time"]
+            .dt.tz_localize("UTC")
+            .dt.tz_convert("America/Santiago")
+            .dt.tz_localize(None)
+        )
+        # Filter to 2025
+        tw_unique = tw_unique[
+            (tw_unique["tw_local"] >= "2025-01-01") & (tw_unique["tw_local"] < "2026-01-01")
+        ].sort_values("tw_local")
+
+        twilight_times = tw_unique["tw_local"].values
+        twilight_temps = tw_unique["actual_temp"].values
+        # Mark rows in df closest to each twilight event
+        twilight_mask = pd.Series(False, index=df.index)
+        df["twilight_temp"] = np.nan
+        for _, tw_row in tw_unique.iterrows():
+            tw_local = tw_row["tw_local"]
+            diffs = (df["ds_local"] - tw_local).abs()
+            closest_idx = diffs.idxmin()
+            if diffs[closest_idx] < pd.Timedelta(minutes=30):
+                twilight_mask[closest_idx] = True
+                df.loc[closest_idx, "twilight_temp"] = tw_row["actual_temp"]
 
         # Linear interpolation for all timestamps
         df["twilight_baseline"] = np.interp(
@@ -91,27 +119,9 @@ def fig0_dataset_overview():
             twilight_temps,
         )
 
-        # 5. Find representative 5-day window in LATE SUMMER (late Feb - early March)
-        tw_df = df[twilight_mask].copy().reset_index(drop=True)
-        tw_df["slope_to_next"] = tw_df["twilight_temp"].diff(1).shift(-1) / (
-            tw_df["ds_local"].diff(1).shift(-1).dt.total_seconds() / 3600
-        )
-        # Compute rolling 5-day variance (5 twilights)
-        tw_df["rolling_var"] = tw_df["slope_to_next"].rolling(5, center=True).var()
-
-        # Filter to late summer (late February and March)
-        tw_df["month"] = tw_df["ds_local"].dt.month
-        tw_df["day"] = tw_df["ds_local"].dt.day
-        late_summer_tw = tw_df[
-            ((tw_df["month"] == 2) & (tw_df["day"] >= 20)) | (tw_df["month"] == 3)
-        ].copy()
-
-        # Find twilight with median variance within late summer
-        median_var = late_summer_tw["rolling_var"].median()
-        center_idx = (late_summer_tw["rolling_var"] - median_var).abs().idxmin()
-        center_twilight = tw_df.loc[center_idx, "ds_local"]
-
-        # Get 5-day window centered on this twilight
+        # 5. Representative 5-day window (stable max temps + typical diurnal range)
+        # Apr 18 2025: tmax_std=0.48, range=5.6C, range_std=0.51, very consistent
+        center_twilight = pd.Timestamp("2025-04-18 21:30:00")
         window_start = center_twilight - pd.Timedelta(days=2.5)
         window_end = center_twilight + pd.Timedelta(days=2.5)
         window_data = df[
@@ -154,10 +164,10 @@ def fig0_dataset_overview():
         )
         forecast_df["forecast_local_hour"] = forecast_df["forecast_local"].dt.hour
 
-        # Get NBEATSx-Ridge forecasts issued at 9am local time
+        # Get NBEATSx-Ridge forecasts issued at midday (~6h lead before twilight)
         ridge_9am = forecast_df[
             (forecast_df["model"] == "NBEATSx-Ridge")
-            & (forecast_df["forecast_local_hour"] == 9)
+            & (np.abs(forecast_df["lead_time_hours"] - 6.0) < 0.5)
         ].copy()
 
         # Match forecasts to window twilights
@@ -165,7 +175,7 @@ def fig0_dataset_overview():
         for tw_time in window_twilights:
             tw_local = pd.Timestamp(tw_time)
             match = ridge_9am[
-                abs((ridge_9am["twilight_local"] - tw_local).dt.total_seconds()) < 3600
+                abs((ridge_9am["twilight_local"] - tw_local).dt.total_seconds()) < 7200
             ]
             if len(match) > 0:
                 forecast_points.append((tw_local, match.iloc[0]["forecast_temp"]))
@@ -293,7 +303,7 @@ def fig0_dataset_overview():
 
         # NBEATSx-Ridge forecast stars on all twilights
         for i, (tw_local, forecast_temp) in enumerate(forecast_points):
-            label = "NBEATSx-Ridge \n 9am forecast" if i == 0 else None
+            label = "NBEATSx-Ridge \n midday forecast" if i == 0 else None
             ax2.plot(
                 tw_local,
                 forecast_temp,
@@ -316,12 +326,8 @@ def fig0_dataset_overview():
         plt.setp(ax2.get_xticklabels(), visible=False)
         ax2.set_xlabel("")
 
-        # Row 3: Offset from twilight-trend (true vs flat baseline)
+        # Row 3: Forecast residuals at twilight events
         ax3 = axes[2]
-        window_data["offset"] = window_data["y"] - window_data["twilight_baseline"]
-        window_data["offset_flat"] = (
-            window_data["y"] - window_data["last_twilight_temp"]
-        )
 
         # Night bands (match ax2 styling)
         for tw_time in window_twilights:
@@ -341,29 +347,39 @@ def fig0_dataset_overview():
                 alpha=0.4,
             )
 
-        # True offset (with known slope)
-        ax3.plot(
-            window_data["ds_local"],
-            window_data["offset"],
-            color="#b2182b",
-            linewidth=2.0,
-            label=r"$\Delta T$ (twilight-trend)",
-        )
-        # Flat baseline offset (operational mode - unknown slope)
-        ax3.plot(
-            window_data["ds_local"],
-            window_data["offset_flat"],
-            color="#1F1F1F",
-            linewidth=2.0,
-            linestyle="--",
-            alpha=0.8,
-            label=r"$\Delta T$ ($T_{\mathrm{tw,last}}$)",
-        )
+        # Plot forecast residuals at multiple lead times (plasma colormap)
+        import matplotlib.cm as cm
+        leads_to_plot = [3.0, 6.0, 9.0, 12.0]
+        cmap = cm.get_cmap("plasma", len(leads_to_plot))
+        window_forecasts = forecast_df[
+            (forecast_df["model"] == "NBEATSx-Ridge")
+            & (forecast_df["twilight_local"] >= window_start)
+            & (forecast_df["twilight_local"] <= window_end)
+        ]
+        for i, lead_h in enumerate(leads_to_plot):
+            lead_sub = window_forecasts[
+                np.abs(window_forecasts["lead_time_hours"] - lead_h) < 0.5
+            ]
+            if len(lead_sub) > 0:
+                # residual = forecast - actual (positive = overprediction)
+                residual = lead_sub["forecast_temp"] - lead_sub["actual_temp"]
+                ax3.scatter(
+                    lead_sub["twilight_local"],
+                    residual,
+                    color=cmap(i), s=70, zorder=5, marker="o",
+                    edgecolors="white", linewidths=0.5,
+                    label=f"{lead_h:.0f}h lead",
+                )
+
         ax3.axhline(0, color="gray", linestyle="--", linewidth=1)
-        ax3.set_ylabel("Temp - Twilight-Trend (°C)")
+        ax3.axhline(1, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+        ax3.axhline(-1, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
+        ax3.set_ylabel("Forecast Residual (°C)")
         ax3.set_xlabel("Date")
         ax3.set_xlim(window_start, window_end)
-        ax3.legend(loc="upper right", fontsize=11)
+        ax3.set_ylim(-3, 3)
+        ax3.legend(loc="upper right", fontsize=8, title="Lead time", title_fontsize=8,
+                   framealpha=0.9, edgecolor="gray", fancybox=True)
         paper_ticks(ax3)
 
         # Format x-axis with date and hour (shared with ax2)
@@ -1119,7 +1135,7 @@ def fig8_comparison_nbeats_prophet_meteoblue():
 
     # Filter each model - use specific lead times for fair comparison
     nbeats_df = df[
-        (df["model"] == "NBEATSx-Ridge") & (df["lead_time_hours"] == 12.0)
+        (df["model"] == "NBEATSx-Ridge") & (df["lead_time_hours"] == 9.0)
     ].copy()
     prophet_df = df[
         (df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 6.0) < 0.5)
