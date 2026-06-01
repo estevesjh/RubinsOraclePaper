@@ -58,7 +58,7 @@ def main():
     ds_real_arr = grid["ds_real"].values
     print(f"   Test twilights: {len(tw_test)}")
 
-    # 3. Persistence
+    # 3. Persistence (temperature at forecast issuance time)
     print("\n3. Persistence...")
     persist_rows = []
     for _, ev in tw_test.iterrows():

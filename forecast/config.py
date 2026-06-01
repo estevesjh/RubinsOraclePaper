@@ -26,10 +26,10 @@ SOLAR_GRID_FREQ = "1800s"
 
 # NBEATSx model
 NBEATS_INPUT_SIZE = 48        # 1 solar day lookback
-NBEATS_HORIZON = 26           # >12h to ensure 12h lead is covered
+NBEATS_HORIZON = 26           # covers up to 12h lead
 NBEATS_MAX_STEPS = 500
 
-# Evaluation (max 12h lead)
+# Evaluation lead times (0.5h steps, max 12h due to 12h differencing anchor)
 LEAD_TIMES_HOURS = list(np.arange(0.5, 12.5, 0.5))
 
 # Ridge correction

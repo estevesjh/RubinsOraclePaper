@@ -97,7 +97,7 @@ def load_and_prepare():
         solar_grid=True,
         solar_grid_step=SOLAR_GRID_STEP,
         solar_grid_fillna=True,
-        sun_alt_midpoint=-25.0,
+        sun_alt_midpoint=-20.0,
         smooth_window_hours=1.0,  # 1h Gaussian smoothing (data is noisy)
         input_size=NBEATS_INPUT_SIZE,
         horizon=NBEATS_HORIZON,
@@ -115,6 +115,7 @@ def load_and_prepare():
     grid["y_lag_12"] = grid["y"].shift(12)      # 6h ago
     grid["y_lag_24"] = grid["y"].shift(HALFDAY_LAG_STEPS)  # 12h ago (anchor)
     grid["y_lag_48"] = grid["y"].shift(48)      # 24h ago
+    grid["y_lag_96"] = grid["y"].shift(96)      # 2 days ago
 
     # Backward OLS slope over 4 grid steps (~2h at 30-min cadence)
     window = 4
@@ -159,6 +160,23 @@ def load_and_prepare():
     # Causal 24h mean temperature (rolling mean over last 48 steps)
     grid["Tmean_24h"] = pd.Series(y_arr).rolling(48, min_periods=24).mean().values
 
+    # Cooling rate over 3h (= (y[t] - y[t-6]) / 6)
+    grid["cooling_rate_3h"] = (y_arr - np.roll(y_arr, 6)) / 6.0
+    grid.iloc[:6, grid.columns.get_loc("cooling_rate_3h")] = np.nan
+
+    # 24h mean change over 1 day and 3 days
+    mean_24h = pd.Series(y_arr).rolling(48, min_periods=24).mean()
+    grid["dmean_1d"] = mean_24h.values - mean_24h.shift(48).values
+    grid["dmean_3d"] = mean_24h.values - mean_24h.shift(144).values
+
+    # Rolling std over last 24h
+    grid["last_std_24h"] = pd.Series(y_arr).rolling(48, min_periods=24).std().values
+
+    # DTR over 3 days (max-min from 5h-smoothed data over 144 steps)
+    max_3d = pd.Series(y_smooth_5h).rolling(144, min_periods=48).max().values
+    min_3d = pd.Series(y_smooth_5h).rolling(144, min_periods=48).min().values
+    grid["DTR_3d"] = max_3d - min_3d
+
     # Add differenced targets
     print("Building differenced targets...")
     grid["D"] = grid["y"] - grid["y"].shift(HALFDAY_LAG_STEPS)       # 12h lag (long-range)
@@ -181,7 +199,7 @@ def find_twilight_targets(grid):
     """
     alt = grid["alt_sun"].values
     y_arr = grid["y"].values
-    midpoint = -25.0  # target altitude
+    midpoint = -20.0  # target altitude
 
     # 3h Gaussian smoothing for validation actuals (centered)
     # On 48-step/day grid: 3h = 6 steps, use Gaussian with std ~2 steps
@@ -222,11 +240,14 @@ def get_hist_futr_exog(cfg):
     hist_exog = [
         "y_raw",             # absolute temperature
         "y_lag_6",           # 3h ago
-        "y_lag_12",          # 6h ago
         "y_lag_24",          # 12h ago (the reconstruction anchor)
         "y_lag_48",          # 24h ago
+        "y_lag_96",          # 2 days ago
         "trend_solar_2h",   # backward OLS slope
-        "DTR",              # daily temperature range (5h smoothed)
+        "cooling_rate_3h",  # (y[t] - y[t-6]) / 6
+        "dmean_1d",         # 24h mean change over 1 day
+        "dmean_3d",         # 24h mean change over 3 days
+        "last_std_24h",     # rolling std over last 24h
     ]
     futr_exog = [
         "solar_sin",
@@ -237,7 +258,7 @@ def get_hist_futr_exog(cfg):
     return hist_exog, futr_exog
 
 
-def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_diff_v3", use_cache=True):
+def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt", use_cache=True):
     """Train NBEATSx on a differenced target."""
     from neuralforecast import NeuralForecast
     from neuralforecast.losses.pytorch import HuberLoss
@@ -718,7 +739,7 @@ def main():
     print("\n" + "=" * 70)
     print("TRAINING NBEATSx-Diff (12h lag)")
     print("=" * 70)
-    model_long = train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_diff_v2")
+    model_long = train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt")
 
     # Step 4: Predict and evaluate (single long-lag model for all leads)
     print("\n" + "=" * 70)

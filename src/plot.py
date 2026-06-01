@@ -119,11 +119,14 @@ def fig0_dataset_overview():
             twilight_temps,
         )
 
-        # 5. Representative 5-day window (stable max temps + typical diurnal range)
-        # Apr 18 2025: tmax_std=0.48, range=5.6C, range_std=0.51, very consistent
-        center_twilight = pd.Timestamp("2025-04-18 21:30:00")
+        # 5. Representative 5-day window with trend change
+        # Jun 7 2025: ~6°C mean temp change over 5 days (winter transition)
+        center_twilight = pd.Timestamp("2025-06-07 22:30:00")
         window_start = center_twilight - pd.Timedelta(days=2.5)
         window_end = center_twilight + pd.Timedelta(days=2.5)
+        # Compute differenced signals on full df before slicing
+        df["D_half"] = df["y"] - df["y"].shift(48)   # 48 steps @ 15min = 12h = 0.5 SD
+        df["D_full"] = df["y"] - df["y"].shift(96)   # 96 steps @ 15min = 24h = 1 SD
         window_data = df[
             (df["ds_local"] >= window_start) & (df["ds_local"] <= window_end)
         ].copy()
@@ -319,14 +322,14 @@ def fig0_dataset_overview():
         ax2.set_ylabel("Temperature (°C)")
         ax2.set_title("Representative 5-Day Window")
         ax2.set_xlim(window_start, window_end)
-        ax2.legend(loc="upper right", fontsize=11)
+        ax2.legend(loc="lower right", fontsize=11)
         paper_ticks(ax2)
 
         # Hide x-tick labels on ax2 (shared with ax3)
         plt.setp(ax2.get_xticklabels(), visible=False)
         ax2.set_xlabel("")
 
-        # Row 3: Forecast residuals at twilight events
+        # Row 3: D = T(tn) - T(tn - 1/2 solar day) — the differenced target
         ax3 = axes[2]
 
         # Night bands (match ax2 styling)
@@ -347,39 +350,27 @@ def fig0_dataset_overview():
                 alpha=0.4,
             )
 
-        # Plot forecast residuals at multiple lead times (plasma colormap)
-        import matplotlib.cm as cm
-        leads_to_plot = [3.0, 6.0, 9.0, 12.0]
-        cmap = cm.get_cmap("plasma", len(leads_to_plot))
-        window_forecasts = forecast_df[
-            (forecast_df["model"] == "NBEATSx-Ridge")
-            & (forecast_df["twilight_local"] >= window_start)
-            & (forecast_df["twilight_local"] <= window_end)
-        ]
-        for i, lead_h in enumerate(leads_to_plot):
-            lead_sub = window_forecasts[
-                np.abs(window_forecasts["lead_time_hours"] - lead_h) < 0.5
-            ]
-            if len(lead_sub) > 0:
-                # residual = forecast - actual (positive = overprediction)
-                residual = lead_sub["forecast_temp"] - lead_sub["actual_temp"]
-                ax3.scatter(
-                    lead_sub["twilight_local"],
-                    residual,
-                    color=cmap(i), s=70, zorder=5, marker="o",
-                    edgecolors="white", linewidths=0.5,
-                    label=f"{lead_h:.0f}h lead",
-                )
-
+        ax3.plot(
+            window_data["ds_local"],
+            window_data["D_full"],
+            color="gray",
+            linewidth=1.5,
+            alpha=0.7,
+            label=r"$T(t) - T(t - 1\,\mathrm{SD})$",
+        )
+        ax3.plot(
+            window_data["ds_local"],
+            window_data["D_half"],
+            color="#b2182b",
+            linewidth=2.0,
+            label=r"$\Delta T = T(t) - T(t - \frac{1}{2}\,\mathrm{SD})$",
+        )
         ax3.axhline(0, color="gray", linestyle="--", linewidth=1)
-        ax3.axhline(1, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
-        ax3.axhline(-1, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
-        ax3.set_ylabel("Forecast Residual (°C)")
+        ax3.set_ylabel(r"$\Delta T$ (°C)")
         ax3.set_xlabel("Date")
         ax3.set_xlim(window_start, window_end)
-        ax3.set_ylim(-3, 3)
-        ax3.legend(loc="upper right", fontsize=8, title="Lead time", title_fontsize=8,
-                   framealpha=0.9, edgecolor="gray", fancybox=True)
+        ax3.set_ylim(-9, 9)
+        ax3.legend(loc="upper right", fontsize=11)
         paper_ticks(ax3)
 
         # Format x-axis with date and hour (shared with ax2)
@@ -556,6 +547,124 @@ def paper_ticks(ax):
     ax.tick_params(which="minor", length=2, width=0.8)
 
 
+def fig3_rmse_vs_lead_time():
+    """Figure 3: RMSE vs lead time line plot (same style as fig5_cdf)."""
+    print("Generating Figure 3: RMSE vs lead time...")
+
+    sns.set_theme(
+        style="white",
+        context="paper",
+        font_scale=1.8,
+        rc={
+            "axes.linewidth": 1.5,
+            "lines.linewidth": 2.0,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+        },
+    )
+
+    results = load_results()
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.minorticks_on()
+
+    models_to_plot = [
+        "Persistence",
+        "Prophet",
+        "RandomForest",
+        "MLP",
+        "Linear",
+        "NBEATSx-Ridge",
+    ]
+
+    # Color palette: warm for baselines, cool for deep learning
+    line_colors = {
+        "Persistence": "#ffb703",       # Gold/yellow
+        "Prophet": "#8338ec",           # Purple
+        "RandomForest": "#fb8500",      # Orange
+        "MLP": "#e63946",              # Coral red
+        "Linear": "#00b4d8",           # Bright blue
+        "NBEATSx-Ridge": "#023e8a",    # Dark navy
+    }
+
+    line_labels = {
+        "Persistence": "Persistence",
+        "Prophet": "Prophet",
+        "RandomForest": "Random Forest",
+        "MLP": "MLP",
+        "Linear": "Linear",
+        "NBEATSx-Ridge": "NBEATSx-Blend",
+    }
+
+    lead_times = np.arange(0.5, 12.5, 0.5)
+    N_BOOT = 1000
+
+    for model in models_to_plot:
+        model_data = results[results["model"] == model]
+        if len(model_data) == 0:
+            continue
+        rmses = []
+        rmse_lo = []
+        rmse_hi = []
+        valid_lts = []
+        for lt in lead_times:
+            subset = model_data[np.abs(model_data["lead_time_hours"] - lt) < 0.01]
+            if len(subset) > 0:
+                errors = subset["error"].values
+                rmse = np.sqrt(np.mean(errors ** 2))
+                rmses.append(rmse)
+                valid_lts.append(lt)
+                # Bootstrap 95% CI
+                boot_rmses = np.array([
+                    np.sqrt(np.mean(np.random.choice(errors, size=len(errors), replace=True) ** 2))
+                    for _ in range(N_BOOT)
+                ])
+                rmse_lo.append(np.percentile(boot_rmses, 2.5))
+                rmse_hi.append(np.percentile(boot_rmses, 97.5))
+
+        valid_lts = np.array(valid_lts)
+        rmses = np.array(rmses)
+        rmse_lo = np.array(rmse_lo)
+        rmse_hi = np.array(rmse_hi)
+
+        ax.fill_between(
+            valid_lts, rmse_lo, rmse_hi,
+            color=line_colors[model], alpha=0.15,
+        )
+        ax.plot(
+            valid_lts,
+            rmses,
+            label=line_labels[model],
+            color=line_colors[model],
+            linewidth=2.5,
+            marker="o",
+            markersize=4,
+        )
+
+    # Reference lines
+    ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5, linewidth=1.0)
+    ax.axvline(3.0, color="#023e8a", linestyle=":", alpha=0.5, linewidth=1.5)
+
+    ax.set_xlabel("Lead Time (hours)")
+    ax.set_ylabel("RMSE (°C)")
+    ax.set_title("RMSE vs Lead Time")
+    ax.legend(loc="upper left", framealpha=0.9)
+    ax.set_xlim(0, 12.5)
+    ax.set_ylim(0, 3.0)
+
+    for spine in ax.spines.values():
+        spine.set_color("black")
+        spine.set_linewidth(1.5)
+    paper_ticks(ax)
+    plt.tight_layout()
+    plt.savefig(FIGURES_PATH / "fig3_rmse_vs_lead_time.png", dpi=150, bbox_inches="tight")
+    plt.savefig(FIGURES_PATH / "fig3_rmse_vs_lead_time.pdf", bbox_inches="tight")
+    plt.close()
+    print("  Saved fig3_rmse_vs_lead_time.png/pdf")
+
+
 def fig5_cdf_absolute_error():
     """Figure 5: CDF of absolute error at 3h."""
     print("Generating Figure 5: CDF of absolute error...")
@@ -579,32 +688,41 @@ def fig5_cdf_absolute_error():
     plt.minorticks_on()
     sns.despine(top=False, right=False, left=False, bottom=False)
 
-    # Load paper_results_final.csv (has Prophet data)
+    # Load paper_results_final.csv
     results_file = RESULTS_PATH / "paper_results_final.csv"
     results = pd.read_csv(results_file)
     results["abs_error"] = np.abs(results["error"])
-    at_3h = results[np.abs(results["lead_time_hours"] - 3.0) < 0.15]
+    at_3h = results[np.abs(results["lead_time_hours"] - 3.0) < 0.01]
 
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.minorticks_on()
-    # Models to plot
+
+    # Same models, colors, and labels as fig3
     models_to_plot = [
-        "Persistence-Twilight",
+        "Persistence",
+        "Prophet",
         "RandomForest",
         "MLP",
-        "Prophet",
-        "NBEATSx-Oracle",
+        "Linear",
         "NBEATSx-Ridge",
     ]
 
-    # Color palette: warm colors for baselines, cool blues for deep learning
     cdf_colors = {
-        "Persistence-Twilight": "#ffb703",  # Gold/yellow
-        "RandomForest": "#fb8500",  # Orange
-        "MLP": "#e63946",  # Coral red
-        "Prophet": "#00b4d8",  # Bright blue
-        "NBEATSx-Oracle": "#0077b6",  # Royal blue
-        "NBEATSx-Ridge": "#023e8a",  # Dark navy
+        "Persistence": "#ffb703",       # Gold/yellow
+        "Prophet": "#8338ec",           # Purple
+        "RandomForest": "#fb8500",      # Orange
+        "MLP": "#e63946",              # Coral red
+        "Linear": "#00b4d8",           # Bright blue
+        "NBEATSx-Ridge": "#023e8a",    # Dark navy
+    }
+
+    cdf_labels = {
+        "Persistence": "Persistence",
+        "Prophet": "Prophet",
+        "RandomForest": "Random Forest",
+        "MLP": "MLP",
+        "Linear": "Linear",
+        "NBEATSx-Ridge": "NBEATSx-Blend",
     }
 
     # Store NBEATSx-Ridge data for reference line
@@ -616,17 +734,15 @@ def fig5_cdf_absolute_error():
             continue
         sorted_errors = np.sort(model_data["abs_error"])
         cdf = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
-        linestyle = "-"
         ax.plot(
             sorted_errors,
             cdf,
-            label=model,
-            color=cdf_colors.get(model, "gray"),
+            label=cdf_labels[model],
+            color=cdf_colors[model],
             linewidth=2.5,
-            linestyle=linestyle,
+            linestyle="-",
         )
 
-        # Store percentage at 1°C for NBEATSx-Ridge
         if model == "NBEATSx-Ridge":
             nbeats_ridge_pct = (model_data["abs_error"] < 1.0).mean()
 
@@ -635,7 +751,7 @@ def fig5_cdf_absolute_error():
         1.0, color=cdf_colors["NBEATSx-Ridge"], linestyle="--", alpha=0.7, linewidth=1.5
     )
 
-    # Horizontal line at 98% for NBEATSx-Ridge at 1°C target
+    # Horizontal line for NBEATSx-Blend at 1°C
     if nbeats_ridge_pct is not None:
         ax.hlines(
             nbeats_ridge_pct,
@@ -654,7 +770,7 @@ def fig5_cdf_absolute_error():
             f"{nbeats_ridge_pct * 100:.0f}%",
             fontsize=12,
             va="center",
-            color="#e63946",
+            color=cdf_colors["NBEATSx-Ridge"],
             fontweight="bold",
         )
 
@@ -1133,19 +1249,14 @@ def fig8_comparison_nbeats_prophet_meteoblue():
     df = pd.read_csv(results_file)
     df["twilight_time"] = pd.to_datetime(df["twilight_time"])
 
-    # Filter each model - use specific lead times for fair comparison
-    nbeats_df = df[
-        (df["model"] == "NBEATSx-Ridge") & (df["lead_time_hours"] == 9.0)
-    ].copy()
-    prophet_df = df[
-        (df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 6.0) < 0.5)
-    ].copy()
-    # MeteoBlue: use all available forecasts (no lead time filter)
+    # NBEATSx and Prophet at 6h lead; MeteoBlue uses all available
+    nbeats_df = df[(df["model"] == "NBEATSx-Ridge") & (np.abs(df["lead_time_hours"] - 6.0) < 0.01)].copy()
+    prophet_df = df[(df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 6.0) < 0.5)].copy()
     meteoblue_df = df[df["model"] == "MeteoBlue"].copy()
 
-    print(f"  NBEATSx-Ridge (12h): {len(nbeats_df)} points")
+    print(f"  NBEATSx-Blend (6h): {len(nbeats_df)} points")
     print(f"  Prophet (6h): {len(prophet_df)} points")
-    print(f"  MeteoBlue: {len(meteoblue_df)} points")
+    print(f"  MeteoBlue (all): {len(meteoblue_df)} points")
 
     # Colors (matching fig5 CDF palette)
     colors = {
@@ -1165,7 +1276,7 @@ def fig8_comparison_nbeats_prophet_meteoblue():
     )
 
     datasets = [
-        (nbeats_df, "NBEATSx-Ridge (12h)", colors["NBEATSx-Ridge"]),
+        (nbeats_df, "NBEATSx-Blend (6h)", colors["NBEATSx-Ridge"]),
         (prophet_df, "Prophet (6h)", colors["Prophet"]),
         (meteoblue_df, "MeteoBlue", colors["MeteoBlue"]),
     ]
@@ -1364,6 +1475,7 @@ def main():
     # Generate all figures (matching main.tex)
     fig0_dataset_overview()
     fig2_rmse_heatmap()
+    fig3_rmse_vs_lead_time()
     fig5_cdf_absolute_error()
     fig6_seasonal_trend_analysis()
     fig7_rate_forecast()

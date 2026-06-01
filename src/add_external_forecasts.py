@@ -94,26 +94,29 @@ def handle_prophet_failures(
 
 
 def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
-    """Extract Prophet-BMA forecasts matched to twilight events.
+    """Extract Prophet-BMA forecasts matched to twilight events by interpolation.
 
-    Applies BMA weighting and model failure handling.
-    For each twilight event and lead time, finds the closest Prophet forecast.
+    For each twilight event and lead time, interpolates Prophet's y_hat to
+    the exact twilight time using the surrounding 30-min grid points.
     """
     print("Processing Prophet-BMA forecasts...")
 
     # Target lead times (same as other models)
-    TARGET_LEAD_TIMES = [0.5, 1.0, 3.0, 6.0, 9.0, 12.0]
+    TARGET_LEAD_TIMES = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
 
-    # Load Prophet data
+    # Load Prophet data with BMA blending (short + long term models)
     df = pd.read_csv(PROPHET_FILE)
     df = df.rename(columns={"timestamp": "valid_time"})
     df["valid_time"] = pd.to_datetime(df["valid_time"])
-
-    # Apply blending
-    df = apply_prophet_blending(df)
-
-    # Handle model failures
-    df = handle_prophet_failures(df)
+    # Apply blending only where component columns exist
+    has_components = "yhat_short" in df.columns and df["yhat_short"].notna().any()
+    if has_components:
+        mask = df["yhat_short"].notna() & df["yhat_long"].notna()
+        df_blend = apply_prophet_blending(df[mask])
+        df_blend = handle_prophet_failures(df_blend)
+        # For rows without components, keep original y_hat
+        df.loc[mask, "y_hat"] = df_blend["y_hat"].values
+    df = df.dropna(subset=["y_hat", "y"])
 
     # Get twilight events
     twilight_events = twilight_events.copy()
@@ -125,32 +128,30 @@ def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
         df_lt = df[np.abs(df["lead_time"] - lt) < 0.1].copy()
         df_lt = df_lt.sort_values("valid_time").reset_index(drop=True)
 
+        # Build interpolation arrays
+        vt_ns = df_lt["valid_time"].values.astype("int64")
+        yhat_arr = df_lt["y_hat"].values
+        y_arr = df_lt["y"].values
+
         for _, tw_row in twilight_events.iterrows():
             tw_time = tw_row["twilight_time"]
+            tw_ns = tw_time.value
 
-            # Find closest Prophet forecast (within 1 hour window)
-            time_diff = np.abs((df_lt["valid_time"] - tw_time).dt.total_seconds())
-            within_window = time_diff < 3600  # 1 hour window
-
-            if not within_window.any():
+            # Check if twilight is within Prophet's valid range
+            if tw_ns < vt_ns[0] or tw_ns > vt_ns[-1]:
                 continue
 
-            # Get the closest point
-            closest_idx = time_diff[within_window].idxmin()
-            match = df_lt.loc[closest_idx]
-
-            # Use Prophet's own y (actual temp it was predicting) for fair comparison
-            actual_temp = match["y"]
-            forecast_temp = match["y_hat"]
+            # Interpolate y_hat and y to exact twilight time
+            forecast_temp = float(np.interp(tw_ns, vt_ns, yhat_arr))
+            actual_temp = float(np.interp(tw_ns, vt_ns, y_arr))
             error = forecast_temp - actual_temp
 
-            # Skip outliers
             if np.abs(error) > 10.0:
                 continue
 
             results.append({
-                "twilight_time": match["valid_time"],  # Use Prophet's exact time
-                "forecast_time": match["valid_time"] - pd.Timedelta(hours=lt),
+                "twilight_time": tw_time,
+                "forecast_time": tw_time - pd.Timedelta(hours=lt),
                 "lead_time_hours": lt,
                 "actual_temp": actual_temp,
                 "model": "Prophet",
@@ -167,9 +168,10 @@ def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
 
 
 def process_meteoblue_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
-    """Extract MeteoBlue forecasts for each twilight event.
+    """Extract MeteoBlue forecasts by interpolation at twilight and nighttime hours.
 
-    For each twilight event, finds the closest MeteoBlue forecast within a 2-hour window.
+    For each model run, reindex to a DatetimeIndex and interpolate at all
+    target times (twilight + 0..6h) in one vectorized call.
     """
     print("Processing MeteoBlue forecasts...")
 
@@ -178,42 +180,51 @@ def process_meteoblue_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
     df["issue_time"] = pd.to_datetime(df["issue_time"], utc=True)
     df["valid_time"] = pd.to_datetime(df["valid_time"], utc=True)
 
-    # Sort by valid_time for efficient searching
-    df = df.sort_values("valid_time").reset_index(drop=True)
+    # Build target times: twilight + 0,1,...,6h for each twilight event
+    tw_times = pd.to_datetime(twilight_events["twilight_time"]).dt.tz_localize("UTC")
+    actuals = twilight_events["actual_temp"].values
 
-    # Match to twilight events - find closest forecast within 2-hour window
+    target_rows = []
+    for i, tw_utc in enumerate(tw_times):
+        for offset_h in range(2):  # twilight + 0h and +1h only
+            target_rows.append((tw_utc + pd.Timedelta(hours=offset_h), actuals[i], tw_times.iloc[i]))
+    target_times = pd.DatetimeIndex([r[0] for r in target_rows])
+    target_actuals = np.array([r[1] for r in target_rows])
+    target_tw_times = [r[2] for r in target_rows]
+
     results = []
-    for _, tw_row in twilight_events.iterrows():
-        tw_time = tw_row["twilight_time"]
-        actual_temp = tw_row["actual_temp"]
+    for issue_t, run_df in df.groupby("issue_time"):
+        run_df = run_df.sort_values("valid_time").set_index("valid_time")
+        vt_min, vt_max = run_df.index[0], run_df.index[-1]
 
-        # Find MeteoBlue forecasts for this twilight (within 2 hours)
-        tw_time_utc = pd.Timestamp(tw_time).tz_localize("UTC")
-        time_diff = np.abs((df["valid_time"] - tw_time_utc).dt.total_seconds())
-        within_window = time_diff < 7200  # 2 hour window
-
-        if not within_window.any():
+        # Filter targets within this run's valid range
+        mask = (target_times >= vt_min) & (target_times <= vt_max)
+        if not mask.any():
             continue
 
-        # Get the closest point
-        closest_idx = time_diff[within_window].idxmin()
-        match = df.loc[closest_idx]
+        targets_in_range = target_times[mask]
 
-        lead_time = (
-            match["valid_time"] - match["issue_time"]
-        ).total_seconds() / 3600.0
-        forecast_temp = match["temperature"]
-        forecast_time = match["issue_time"]
+        # Interpolate: combine run index with targets, interpolate, extract
+        combined_idx = run_df.index.append(targets_in_range).drop_duplicates().sort_values()
+        interp_series = run_df["temperature"].reindex(combined_idx).interpolate(method="time")
 
-        results.append({
-            "twilight_time": tw_time,
-            "forecast_time": forecast_time.tz_localize(None),
-            "lead_time_hours": lead_time,
-            "actual_temp": actual_temp,
-            "model": "MeteoBlue",
-            "forecast_temp": forecast_temp,
-            "error": forecast_temp - actual_temp,
-        })
+        for j, tgt in enumerate(targets_in_range):
+            forecast_temp = interp_series.loc[tgt]
+            if pd.isna(forecast_temp):
+                continue
+            lead_time = (tgt - issue_t).total_seconds() / 3600.0
+            if lead_time < 0:
+                continue
+            idx = np.where(mask)[0][j]
+            results.append({
+                "twilight_time": target_tw_times[idx].tz_localize(None),
+                "forecast_time": issue_t.tz_localize(None),
+                "lead_time_hours": lead_time,
+                "actual_temp": target_actuals[idx],
+                "model": "MeteoBlue",
+                "forecast_temp": float(forecast_temp),
+                "error": float(forecast_temp) - target_actuals[idx],
+            })
 
     print(f"  Found {len(results)} MeteoBlue forecasts")
     return pd.DataFrame(results)
