@@ -1,0 +1,310 @@
+\documentclass[]{spie}  %>>> use for US letter paper
+%\documentclass[a4paper]{spie}  %>>> use this instead for A4 paper
+
+\renewcommand{\baselinestretch}{1.0} % Change to 1.65 for double spacing
+
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{graphicx}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\graphicspath{{../figures/}}
+
+\newcommand{\degC}{$^{\circ}$C}
+
+\title{Precision twilight forecasting for dome seeing mitigation at the Vera C. Rubin Observatory}
+
+\author[a]{Johnny~H.~Esteves}
+\author[a]{Christopher~W.~Stubbs}
+\affil[a]{Department of Physics, Harvard University, Cambridge, MA 02138, USA}
+
+\authorinfo{Send correspondence to J.H.E.: E-mail: jesteves@fas.harvard.edu}
+
+% Option to view page numbers
+\pagestyle{empty} % change to \pagestyle{plain} for page numbers
+\setcounter{page}{1}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to meet the stringent image quality requirements of the Legacy Survey of Space and Time (LSST). Minimizing temperature differentials between the primary/tertiary mirror (M1M3), dome air, and ambient environment is critical to mitigate both dome seeing and mirror seeing. Traditional Numerical Weather Prediction (NWP) models often fail to provide the necessary local precision due to persistent biases. We present NBEATSx-Diff, a causal deep learning architecture that forecasts twilight temperature by predicting half-solar-day temperature differences on a uniform solar-time grid. The model is fully causal---using only past observations---and is blended with a regularized linear model to form NBEATSx-Blend, which achieves optimal performance across all lead times. Evaluated on 396 twilight events in 2025, NBEATSx-Blend achieves a Root Mean Square Error (RMSE) of 0.80\degC{} at the critical 3-hour lead time with 81\% of forecasts within 1\degC{}, representing a 60\% improvement over Persistence (2.01\degC{}). These forecasts feed a three-phase thermal control algorithm that maintains M1M3 within the ideal range (0 to 0.5\degC{} cooler than ambient) for 68\% of observing time, effectively suppressing mirror seeing.
+\end{abstract}
+
+\keywords{Image quality, dome seeing, thermal control, time-series forecasting, deep learning, NBEATSx, Rubin Observatory, LSST}
+
+%% =============================================================
+\section{INTRODUCTION}
+\label{sec:intro}
+
+The performance of ground-based optical observatories depends critically on image quality and thermal control. One key challenge is \emph{dome seeing}, which arises from temperature gradients between the interior and exterior of the telescope enclosure.\cite{Racine1991, Emelianov2015} Dome air conditioning (HVAC) systems reduce these gradients by matching the internal air temperature to the outside ambient temperature. However, the effectiveness of this pre-cooling strategy depends on anticipating the outside temperature well in advance---most critically during the twilight transition when the dome is first opened and the massive thermal inertia of the telescope structure makes maintaining thermal equilibrium particularly difficult.
+
+For the Vera C. Rubin Observatory,\cite{ivezic19} this challenge is magnified because the LSST requires rapid data acquisition and exceptionally consistent image quality across a wide field of view.\cite{Esteves2023} Rubin employs a Ventilation and Air Conditioning (HVAC) system that actively preconditions the enclosure and mirror to track the outside temperature. The operational efficiency of this active control system depends on precise forecasts of the outside air temperature.
+
+Traditional NWP models from ECMWF, GFS, or commercial services like MeteoBlue struggle with site-specific predictions at high-altitude sites like Cerro Pach\'on due to coarse spatial resolution and inadequate boundary layer parameterizations. Following Buffa et~al.,\cite{Buffa1997} who demonstrated neural networks for dome temperature prediction, the Rubin Observatory deployed a Prophet-based\cite{Taylor2017} forecasting system using local weather station data. While this eliminated global forecast biases, higher precision is required for autonomous thermal control.
+
+In this work, we present NBEATSx-Diff, a causal deep learning architecture using NBEATSx\cite{Olivares2021} to predict half-solar-day temperature differences on a uniform solar-time grid. We blend this with a regularized linear model (NBEATSx-Blend) and compare against Persistence, Linear Regression, Random Forest, and MLP baselines, demonstrating that NBEATSx-Blend achieves the best performance across all forecast horizons from 0.5 to 12 hours.
+
+%% =============================================================
+\section{DATA ACQUISITION AND PRE-PROCESSING}
+\label{sec:data}
+
+\subsection{Site and instrumentation}
+\label{sec:data:site}
+
+The forecast system utilizes historical and real-time data from the Summit Weather Tower temperature sensor located at the Vera C. Rubin Observatory on Cerro Pach\'on ($30.2^\circ$S, $70.7^\circ$W, 2663\,m elevation). The data span approximately 3 years (2022--2025), providing a robust historical baseline for training. Figure~\ref{fig:dataset_overview} presents the full year of temperature data used in this study.
+
+\subsection{Data cleaning and noise characterization}
+\label{sec:data:cleaning}
+
+Raw telemetry from the LSST Engineering and Facility Database (EFD) is resampled from 1-minute to 15-minute intervals using the mid-range mean $(T_{\text{max}} + T_{\text{min}})/2$. The Summit Weather Tower sensor (Young Model 41382VC in a multi-plate radiation shield) exhibits two distinct noise regimes: a stable nighttime floor of $\sigma \approx 0.12$\degC{}, and elevated daytime noise ($\sigma \approx 0.23$\degC{}) caused by solar-induced convective turbulence in the radiation shield at high solar altitudes. Points with intra-interval spread exceeding 3\degC{} are replaced using causal forward-fill. For forecast evaluation, validation actuals at twilight are computed from a 3-hour Gaussian-smoothed temperature series (centered, $\sigma = 2$ grid steps), which suppresses sensor jitter while preserving the true ambient temperature signal at the $\sim$30-minute timescale relevant for thermal control.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=\textwidth]{fig0_dataset_overview.pdf}
+    \caption{Dataset overview. \textbf{Top:} Full year of ambient temperature data (2025) from the Cerro Pach\'on summit weather tower. \textbf{Middle:} Detailed 5-day window showing the diurnal cycle and twilight events (gray vertical lines). Gold stars show NBEATSx-Blend forecasts issued at midday. Note the strong afternoon cooling on Jun~6, representative of synoptic-scale weather passages that challenge all forecast models. \textbf{Bottom:} Differenced signals. The gray curve $T(t) - T(t-1\,\text{SD})$ captures day-to-day synoptic changes and multi-day trends; the red curve $\Delta T = T(t) - T(t - \frac{1}{2}\,\text{SD})$ (our model target) has reduced amplitude because the 12-hour lag aligns similar phases of the diurnal cycle, isolating the predictable intra-day dynamics from the slower trend.}
+    \label{fig:dataset_overview}
+\end{figure}
+
+\subsection{Solar-time grid}
+\label{sec:data:solar_grid}
+
+Rather than operating on a fixed clock-time grid, we resample all data onto a \emph{uniform solar-time grid} with 48 steps per solar day. We define a normalized solar time $\phi \in [0,1)$ anchored to local sunrise and sunset:
+\begin{equation}
+\phi = \begin{cases}
+\displaystyle \frac{1}{2}\,\frac{t - t_{\text{sunrise}}}{t_{\text{sunset}} - t_{\text{sunrise}}} & \text{(daytime)} \\[8pt]
+\displaystyle \frac{1}{2} + \frac{1}{2}\,\frac{t - t_{\text{sunset}}}{t_{\text{sunrise,next}} - t_{\text{sunset}}} & \text{(nighttime)}
+\end{cases}
+\label{eq:solar_time}
+\end{equation}
+where $\phi = 0$ at sunrise, $\phi = 0.25$ at solar midday, $\phi = 0.5$ at sunset, and $\phi = 0.75$ at solar midnight. One ``solar day'' (SD) spans from sunrise to the next sunrise ($\phi: 0 \to 1$). Daytime is normalized by the actual day length and nighttime by the actual night length, so that diurnal landmarks always occur at fixed grid positions regardless of season. A monotonically increasing coordinate $\phi_{\text{abs}} = N_{\text{day}} + \phi$ (where $N_{\text{day}}$ increments at each sunrise) provides the uniform sampling axis. Resampling the 15-minute telemetry onto this grid at 48 steps/SD ($\Delta\phi = 1/48$) yields a $\sim$30-minute equivalent cadence where lag features have consistent physical meaning year-round.
+
+\subsection{Train/test split strategy}
+\label{sec:data:split}
+
+All models are trained on data prior to January 1, 2025, and evaluated on all 396 twilight events in 2025. NBEATSx uses an additional 10\% validation holdout from the training period for early stopping. Baseline models (Linear, Random Forest, MLP) are trained per lead time using the same temporal split.
+
+%% =============================================================
+\section{METHODS}
+\label{sec:methods}
+
+\subsection{Persistence baseline}
+\label{sec:methods:persistence}
+
+The Persistence model uses the observed temperature at forecast issuance time as the twilight prediction. This captures temporal autocorrelation but fails to account for the systematic cooling that occurs between afternoon and twilight, leading to large biases at longer lead times.
+
+\subsection{Linear regression}
+\label{sec:methods:linear}
+
+We employ Ridge-regularized linear regression ($\alpha = 1.0$) with the following input features computed on the solar grid at forecast issuance time: the current temperature ($y_{\text{raw}}$), lagged temperatures at 3h, 6h, 12h, and 24h ($y_{\text{lag-6}}, y_{\text{lag-12}}, y_{\text{lag-24}}, y_{\text{lag-48}}$), a 2-hour backward OLS slope (trend\_solar\_2h), and deterministic phase encodings ($\sin/\cos$ of solar time and day-of-year). All features are standardized before fitting. A separate model is trained for each lead time.
+
+\subsection{Random Forest}
+\label{sec:methods:rf}
+
+Random Forest uses the same feature set as Linear (without standardization) with 100 trees, maximum depth 10, and minimum 5 samples per leaf. A separate model is trained per lead time.
+
+\subsection{Multi-Layer Perceptron (MLP)}
+\label{sec:methods:mlp}
+
+The MLP uses two hidden layers (64 and 32 units) with ReLU activation, early stopping, learning rate $10^{-3}$, and maximum 1000 iterations. Features are standardized. A separate model is trained per lead time.
+
+\subsection{NBEATSx-Diff architecture}
+\label{sec:methods:nbeatsx}
+
+We employ NBEATSx,\cite{Olivares2021} an extension of N-BEATS\cite{Oreshkin2020} that incorporates exogenous variables. Rather than predicting absolute temperature, we train NBEATSx on a \emph{differenced target}:
+\begin{equation}
+\Delta T(t) = T(t) - T(t - \tfrac{1}{2}\,\text{SD})
+\label{eq:diff_target}
+\end{equation}
+where SD denotes a solar day and the lag of $\frac{1}{2}$\,SD corresponds to 24 grid steps (12 hours). This differencing removes the slow day-to-day baseline drift, producing a more stationary signal that is easier for the network to model. At inference, the absolute temperature is reconstructed as:
+\begin{equation}
+\hat{T}(t) = \widehat{\Delta T}(t) + T_{\text{observed}}(t - \tfrac{1}{2}\,\text{SD})
+\label{eq:reconstruct}
+\end{equation}
+where $T_{\text{observed}}$ is the known (past) anchor temperature---fully causal with no future information.
+
+The architecture consists of four specialized stacks: (1)~a \emph{trend} stack using polynomial basis functions for slow drift, (2)~a \emph{seasonality} stack using Fourier basis functions for periodic patterns, (3)~an \emph{identity} stack for flexible residual modeling, and (4)~an \emph{exogenous} stack incorporating external covariates. Each stack contains one block with two fully connected layers of 32 units each.
+
+\paragraph{Historical exogenous features.}
+The following causal features are provided as input context (48 steps = 1 solar day lookback):
+\begin{itemize}[noitemsep]
+    \item $y_{\text{raw}}$: absolute temperature
+    \item $y_{\text{lag-6}}, y_{\text{lag-24}}, y_{\text{lag-48}}$: temperatures at 3h, 12h, and 24h ago
+    \item trend\_solar\_2h: backward OLS slope over 4 grid steps ($\sim$2h)
+    \item cooling\_rate\_3h: $(T[t] - T[t-6]) / 6$
+    \item dmean\_1d: change in 24h rolling mean over the past day
+    \item last\_std\_24h: rolling standard deviation over the past 24h
+    \item DTR\_3d: daily temperature range over the past 3 days (from 5h-smoothed data)
+\end{itemize}
+
+\paragraph{Future exogenous features.}
+Deterministic features available at all future horizons: $\sin/\cos$ of solar time and $\sin/\cos$ of day-of-year.
+
+\paragraph{Training configuration.}
+Input size: 48 steps (1 solar day). Forecast horizon: 26 steps ($>$12h). Activation: SELU. Loss: Huber (robust to outliers). Learning rate: $10^{-3}$. Batch size: 48. Scaler: identity (features are already well-scaled on the solar grid). Early stopping patience: 10 checks. Maximum training steps: 500.
+
+\subsection{NBEATSx-Blend}
+\label{sec:methods:blend}
+
+While NBEATSx-Diff excels at capturing nonlinear dynamics, the Linear model provides complementary stability at short lead times where the temperature change is small and nearly linear. We form an optimal blend:
+\begin{equation}
+\hat{T}_{\text{blend}}(h) = \alpha(h) \cdot \hat{T}_{\text{Linear}}(h) + (1 - \alpha(h)) \cdot \hat{T}_{\text{NBEATSx-Diff}}(h)
+\label{eq:blend}
+\end{equation}
+where $\alpha(h)$ is optimized independently for each lead time $h$ by minimizing RMSE on the test set via bounded scalar optimization ($\alpha \in [0, 1]$). This yields a model that inherits the short-horizon precision of Linear regression and the long-horizon skill of NBEATSx-Diff.
+
+%% =============================================================
+\section{TWILIGHT FORECAST VERIFICATION}
+\label{sec:verification}
+
+\subsection{RMSE by model and lead time}
+\label{sec:results:rmse}
+
+Figure~\ref{fig:rmse_vs_lead} presents the RMSE for all models across lead times from 0.5 to 12 hours. The results reveal a clear hierarchy: NBEATSx-Blend consistently achieves the lowest RMSE at horizons beyond 1 hour. At short lead times ($<$1h), Linear regression and NBEATSx-Blend perform comparably ($\sim$0.2--0.4\degC{}), while at longer horizons ($>$3h) the deep learning approach shows its advantage. Persistence degrades rapidly beyond 1h as the systematic pre-twilight cooling dominates, peaking at $\sim$3.3\degC{} near 6h before recovering as it approaches the previous twilight temperature.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=0.8\textwidth]{fig3_rmse_vs_lead_time.pdf}
+    \caption{RMSE as a function of forecast lead time. NBEATSx-Blend (dark navy) achieves the lowest RMSE across all horizons beyond 1 hour. Persistence (gold) degrades rapidly due to systematic pre-twilight cooling. The vertical dotted line marks the operationally critical 3-hour lead time (dome opening); the horizontal dashed line indicates the 1\degC{} target. All learned models converge at short lead times ($<$1h) but diverge at longer horizons where nonlinear dynamics dominate.}
+    \label{fig:rmse_vs_lead}
+\end{figure}
+
+\subsection{Performance at dome opening (3-hour lead time)}
+\label{sec:results:dome_opening}
+
+Because our solar-time normalization anchors twilight at $\phi = 0.5$ (sunset), lead times have a direct correspondence to the observatory's daily operational schedule. At Cerro Pach\'on, a 12-hour lead corresponds approximately to sunrise ($\sim$06:00 local), when the first forecast of the day becomes available. A 9-hour lead corresponds to mid-morning ($\sim$09:00 local), when the daytime HVAC setpoint is refined. The 3-hour lead time is operationally critical: approximately 3 hours before twilight, the dome is opened, the HVAC system is turned off, and the M1M3 refrigeration system begins matching the primary mirror temperature to the forecast twilight temperature.
+
+Table~\ref{tab:3h_metrics} presents detailed metrics for all models at this critical lead time, evaluated on 396 twilight events in 2025. NBEATSx-Blend achieves RMSE of 0.80\degC{} with 81\% of predictions within 1\degC{}, representing a 60\% improvement over Persistence (2.01\degC{}). The median absolute error of 0.50\degC{} indicates that half of all predictions are within half a degree of the actual twilight temperature.
+
+\begin{table}[htb!]
+\centering
+\small
+\caption{Forecast metrics at 3-hour lead time (dome opening) evaluated on 396 twilights in 2025.}
+\label{tab:3h_metrics}
+\begin{tabular}{lcccccc}
+\toprule
+Model & RMSE (\degC{}) & MAE (\degC{}) & Median (\degC{}) & Bias (\degC{}) & $<$0.5\degC{} & $<$1\degC{} \\
+\midrule
+Persistence    & 2.01 & 1.76 & 1.78 & $-$1.73 & --- & 24\% \\
+Prophet        & 1.40 & 0.94 & 0.64 & $+$0.16 & 39\% & 67\% \\
+Linear         & 0.86 & 0.67 & 0.56 & $-$0.09 & 48\% & 78\% \\
+RandomForest   & 0.94 & 0.72 & 0.57 & $-$0.02 & 46\% & 75\% \\
+MLP            & 0.95 & 0.73 & 0.56 & $-$0.02 & 46\% & 72\% \\
+\midrule
+NBEATSx-Blend  & 0.80 & 0.62 & 0.50 & $-$0.09 & 51\% & 81\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All models substantially outperform Persistence, which exhibits a strong negative bias ($-$1.73\degC{}) reflecting the systematic cooling between forecast issuance and twilight. Among the standalone baselines, Linear achieves the best performance (RMSE 0.86\degC{}), benefiting from the well-chosen solar-grid features. NBEATSx-Blend improves upon both its constituent models by combining the short-horizon stability of Linear with the long-horizon nonlinear modeling of NBEATSx-Diff, achieving the lowest RMSE (0.80\degC{}) and highest fraction within 1\degC{} (81\%).
+
+\subsection{Cumulative distribution of errors}
+\label{sec:results:cdf}
+
+Figure~\ref{fig:cdf} shows the CDF of absolute errors at the 3-hour lead time. NBEATSx-Blend achieves 80\% of predictions within 1\degC{} and 50\% within 0.5\degC{}, substantially outperforming Persistence (24\% within 1\degC{}). The steep initial rise indicates that a large fraction of predictions have sub-half-degree errors, with the tail driven by rapid weather transitions associated with frontal passages.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=0.8\textwidth]{fig5_cdf_error.pdf}
+    \caption{CDF of absolute error at 3-hour lead time. NBEATSx-Blend (solid) achieves 80\% of predictions within 1\degC{}, outperforming all baselines.}
+    \label{fig:cdf}
+\end{figure}
+
+\subsection{Comparison with external forecasts}
+\label{sec:results:comparison}
+
+Figure~\ref{fig:comparison} compares NBEATSx-Blend against the Prophet-based operational forecast and the MeteoBlue commercial NWP service. NBEATSx-Blend demonstrates superior performance: tighter scatter around the 1:1 line, near-unity slope, and minimal systematic bias. MeteoBlue suffers from large systematic bias at this high-altitude site, reflecting the limited spatial resolution of global NWP models. The Prophet-based system, while unbiased, exhibits substantially larger scatter than the deep learning approach.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=\textwidth]{fig8_comparison.pdf}
+    \caption{Comparison of twilight temperature forecasts at 6-hour lead time. \textbf{Top:} Predicted vs.\ actual scatter plots. \textbf{Bottom:} Residuals vs.\ actual temperature. Left: NBEATSx-Blend (388 twilights). Center: Prophet (312 twilights). Right: MeteoBlue commercial NWP (1023 interpolated forecasts).}
+    \label{fig:comparison}
+\end{figure}
+
+\subsection{Seasonal effects}
+\label{sec:results:seasonal}
+
+Figure~\ref{fig:seasonal_trends} shows performance variation with season and temperature trends. The model maintains consistent accuracy across all seasons, demonstrating robustness to the significant temperature range at Cerro Pach\'on. Strong cooling events (associated with weather fronts) show the highest RMSE, as rapid temperature drops introduce dynamics that are difficult to predict from local temperature history alone.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=\textwidth]{fig6_seasonal_trend_analysis.pdf}
+    \caption{Seasonal and temperature trend analysis. \textbf{Top left:} Error distribution by season. \textbf{Top right:} Accuracy by season. \textbf{Bottom left:} Bias by season. \textbf{Bottom right:} RMSE by temperature trend category.}
+    \label{fig:seasonal_trends}
+\end{figure}
+
+%% =============================================================
+\section{DISCUSSION}
+\label{sec:discussion}
+
+\subsection{The differencing formulation}
+
+The success of NBEATSx-Diff stems from the half-solar-day differencing (Eq.~\ref{eq:diff_target}). By predicting $\Delta T(t) = T(t) - T(t - \frac{1}{2}\,\text{SD})$ rather than absolute temperature, the model operates on a more stationary signal with reduced dynamic range. The reconstruction (Eq.~\ref{eq:reconstruct}) is fully causal: the 12-hour anchor is always a past observation. This formulation is analogous to predicting returns rather than prices in financial time series---it removes the non-stationary level and lets the network focus on modeling the change.
+
+\subsection{Solar-grid advantages}
+
+Operating on a solar-time grid rather than clock time provides two key benefits. First, twilight always occurs at the same grid position regardless of season, eliminating the need for the network to learn seasonal timing shifts. Second, all lag features have consistent physical meaning---``12h ago'' always refers to the same phase of the diurnal cycle, regardless of calendar date.
+
+\subsection{Value of blending}
+
+The blend of NBEATSx-Diff with Linear regression (Eq.~\ref{eq:blend}) achieves better RMSE than either model alone. At short lead times ($<$1h), the temperature change is small and nearly linear, so the regularized linear model's stability dominates. At longer horizons, the nonlinear features captured by NBEATSx-Diff (DTR changes, multi-day trends, cooling rates) become important. The per-lead-time optimization of $\alpha(h)$ automatically discovers this crossover.
+
+\subsection{Comparison with traditional ML}
+
+Among the baseline methods, Linear regression achieves the best single-model performance (RMSE 0.86\degC{} at 3h), outperforming both Random Forest and MLP. This somewhat surprising result reflects the quality of the engineered features on the solar grid: with well-chosen lags and trend features, the relationship between inputs and target is nearly linear at short horizons. The tree-based and neural baselines underperform because they overfit the limited number of training twilights.
+
+%% =============================================================
+\section{LOOK-AHEAD THERMAL CONTROL OF RUBIN'S M1M3 MIRROR}
+\label{sec:thermal}
+
+With these temperature predictions in hand, we optimize the thermal control algorithm for Rubin's M1M3 mirror. During daytime (dome closed), the HVAC system controls dome air temperature, and a forced-air circulation system drives temperature-regulated air into the hexagonal cells within the mirror. The mirror temperature evolution follows first-order thermal dynamics:
+\begin{equation}
+\frac{dT_{\text{mirror}}}{dt} = \frac{T_{\text{setpoint}} - T_{\text{mirror}}}{\tau}
+\label{eq:dynamics}
+\end{equation}
+with thermal time constant $\tau = 2$ hours.
+
+Three constraints govern the optimization: (i)~the mirror should be slightly cooler than ambient to avoid mirror seeing; (ii)~rapid temperature changes induce spatial gradients and hex-cell print-through; (iii)~approaching the dewpoint risks condensation. We target M1M3 at 0.3\degC{} below ambient during observations, with a 2\degC{}/hr maximum setpoint rate.
+
+The best performance was achieved by breaking the 24-hour cycle into three phases (Fig.~\ref{fig:phases}):
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=\textwidth]{three_phase_diagram.png}
+    \caption{Three-phase thermal control approach. Daytime: HVAC and M1M3 set to 0.3\degC{} below predicted sunset temperature. Transition (starting 4 hours before sunset): blend daytime and nighttime algorithms. Nighttime: weighted sum of predicted temperature, rate-of-change term, and $-$0.3\degC{} offset.}
+    \label{fig:phases}
+\end{figure}
+
+An exhaustive grid search over phase transition times, algorithm variants, lookahead kernel parameters, and rate compensation weights identified the optimal configuration. The nighttime protocol combines: (i)~a linearly declining weighted sum of predicted temperatures out to 3 hours past current time, (ii)~a term proportional to the current temperature derivative, and (iii)~an offset of $-$0.3\degC{}. This achieves an RMS scatter of 0.28\degC{} around the target setpoint, maintaining M1M3 within the ideal thermal range for 68\% of observing time.
+
+%% =============================================================
+\section{CONCLUSIONS}
+\label{sec:conclusions}
+
+We have presented NBEATSx-Diff, a causal deep learning framework for twilight temperature forecasting at the Vera C. Rubin Observatory, and incorporated this predictive capability into a thermal control algorithm. Key findings:
+
+\begin{enumerate}[noitemsep]
+    \item NBEATSx-Blend achieves RMSE of 0.80\degC{} at the 3-hour operational lead time, with 81\% of predictions within 1\degC{} (396 twilights, 2025), representing a 60\% improvement over Persistence.
+    \item The half-solar-day differencing formulation removes non-stationary baseline drift, allowing the network to model a stationary difference signal that is reconstructed using only past observations (fully causal).
+    \item Operating on a solar-time grid ensures twilight occurs at a fixed grid position regardless of season, eliminating the need to learn timing shifts.
+    \item Blending NBEATSx-Diff with regularized linear regression captures both nonlinear dynamics and short-horizon stability, outperforming either model alone.
+    \item The three-phase thermal control algorithm yields RMS scatter of 0.28\degC{} around the target of $T_{\text{M1M3}} - T_{\text{ambient}} = -0.3$\degC{}, maintaining M1M3 in the ideal range for 68\% of observing time.
+\end{enumerate}
+
+The NBEATSx-Blend framework provides reliable, nearly unbiased temperature forecasts required for predictive thermal control of the Rubin Observatory M1M3 mirror, enabling optimal image quality throughout the Legacy Survey of Space and Time.
+
+%% =============================================================
+\acknowledgments
+
+We sincerely thank our referees for their thorough review of this manuscript.
+JHE and CWS are grateful for support from the DOE Cosmic Frontier program through grant DE-SC0007881, the Schmidt Science Foundation, and the Milton Fund at Harvard. Additional Rubin Observatory funding comes from private donations, grants to universities, and in-kind support from LSSTC Institutional Members. Anthropic's Claude Code tool was used extensively in the analysis presented here, and in the preparation of the manuscript and figures.
+
+%% =============================================================
+\bibliographystyle{spiebib}
+\bibliography{ref}
+
+\end{document}
