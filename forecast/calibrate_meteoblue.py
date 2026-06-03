@@ -6,14 +6,18 @@ older interactive run on a slightly different summit-temperature dataset and
 is not bit-reproducible; the current script reflects the calibration actually
 used by forecast/run.py).
 
-Algorithm (matches the inline calibration in forecast/run.py):
+Algorithm (mirrors forecast/run.py:126-178 exactly):
   1. Load raw MeteoBlue forecasts; keep only causal samples (lead_hours > 0)
-     and the shortest available lead per valid_time.
-  2. Interpolate raw MeteoBlue temperature onto the solar-time grid.
-  3. For each of N_BINS uniform SolarTime bins (default 48), fit a 1-D linear
-     regression T_truth ~ slope * T_meteoblue + bias on PRE-2025 data only.
-  4. Apply the per-bin correction across the full grid; report the residual
-     RMSE per bin.
+     and, for each valid_time, the shortest-lead causal forecast.
+  2. Linearly interpolate the kept (valid_time, temperature) series onto the
+     solar-time grid (np.interp on int64 timestamps); mark grid points
+     outside the MeteoBlue temporal range as NaN.
+  3. For each of N_BINS uniform SolarTime bins (default 48), fit a 1-D
+     ordinary-least-squares regression T_truth ~ slope * T_meteoblue + bias
+     on PRE-2025 (training) data only, requiring strictly more than 30
+     samples in the bin.
+  4. Report the residual RMSE per bin (T_truth - corrected) on the same
+     training subset used for the fit.
 
 The output CSV has one row per bin actually populated by training data:
     bin, solar_time, slope, bias, N, rmse_corrected
@@ -43,7 +47,7 @@ from run import load_and_prepare
 
 
 N_BINS = 48
-MIN_BIN_SAMPLES = 30  # need at least this many train samples to fit a bin
+MIN_BIN_SAMPLES = 30  # require strictly MORE than this; matches run.py's '> 30'
 
 
 def main():
@@ -73,7 +77,10 @@ def main():
           .sort_index()
     )
 
-    # Interpolate raw MeteoBlue onto the solar-time grid; mark out-of-range as NaN
+    # Interpolate MeteoBlue temperature onto the solar-time grid in time:
+    # for each ds_real (int64 ns), linearly interpolate between adjacent
+    # MeteoBlue valid_times. Grid points outside the MeteoBlue temporal
+    # range are set to NaN so they are not used in the fits.
     mb_raw = np.interp(
         ds_real.astype("int64"),
         mb_latest.index.astype("int64"),
@@ -91,14 +98,25 @@ def main():
         in_bin = (solar_time >= bin_edges[b]) & (solar_time < bin_edges[b + 1])
         usable = in_bin & ~np.isnan(mb_raw) & ~np.isnan(y_arr) & train_mask
         n = int(usable.sum())
+        st_centre = float(0.5 * (bin_edges[b] + bin_edges[b + 1]))
+
+        # run.py's behaviour: under-populated bins fall back to identity
+        # correction (slope=1, bias=0) so that mb_corrected == mb_raw there.
+        # We still emit a row so the CSV has all 48 bins.
         if n <= MIN_BIN_SAMPLES:
+            rows.append({
+                "bin": b,
+                "solar_time": st_centre,
+                "slope": 1.0,
+                "bias": 0.0,
+                "N": n,
+                "rmse_corrected": np.nan,
+            })
             continue
+
         slope, bias = np.polyfit(mb_raw[usable], y_arr[usable], 1)
-        # Residual RMSE on the same train-set bin after correction
         corrected = slope * mb_raw[usable] + bias
         rmse = float(np.sqrt(np.mean((y_arr[usable] - corrected) ** 2)))
-        # Bin centre as a representative SolarTime
-        st_centre = float(0.5 * (bin_edges[b] + bin_edges[b + 1]))
         rows.append({
             "bin": b,
             "solar_time": st_centre,
