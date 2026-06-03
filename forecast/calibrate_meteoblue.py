@@ -101,16 +101,22 @@ def main():
         f"(expected {y_arr.shape}, got {mb_raw.shape})"
     )
 
-    # Fit per-bin slope + bias on TRAIN (pre-2025) only
+    # Fit per-bin slope + bias on TRAIN (pre-2025) only.
+    #
+    # NOTE: FeatureBuilder produces SolarTime values that are quantized to
+    # roughly i/N_BINS but with floating-point noise. Half-open bin edges
+    # `[lo, hi)` from np.linspace would silently drop ~1/3 of all samples
+    # into the wrong bin (we observed bins 2/5/8/... ending up with N=0).
+    # Compute bin assignment by rounding instead, which is FP-robust.
     train_mask = ds_real < TEST_START_DATE
-    bin_edges = np.linspace(0.0, 1.0, N_BINS + 1)
+    bin_idx_all = np.round(solar_time * N_BINS).astype(int) % N_BINS
 
     rows = []
     for b in range(N_BINS):
-        in_bin = (solar_time >= bin_edges[b]) & (solar_time < bin_edges[b + 1])
+        in_bin = (bin_idx_all == b)
         usable = in_bin & ~np.isnan(mb_raw) & ~np.isnan(y_arr) & train_mask
         n = int(usable.sum())
-        st_centre = float(0.5 * (bin_edges[b] + bin_edges[b + 1]))
+        st_centre = b / N_BINS  # canonical SolarTime for this bin
 
         # run.py's behaviour: under-populated bins fall back to identity
         # correction (slope=1, bias=0) so that mb_corrected == mb_raw there.
