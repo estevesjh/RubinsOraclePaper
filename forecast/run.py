@@ -31,7 +31,15 @@ import pandas as pd
 
 # Add rubin-twilight-forecast to path for FeatureBuilder
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"))
+_TWILIGHT_CANDIDATES = [
+    os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"),  # slacd convention
+    "/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast",
+    os.path.join(_REPO_ROOT, "..", "rubin-twilight-forecast"),    # local sibling repo
+]
+for _p in _TWILIGHT_CANDIDATES:
+    if os.path.isdir(os.path.join(_p, "twilight")):
+        sys.path.insert(0, os.path.abspath(_p))
+        break
 sys.path.insert(0, os.path.dirname(__file__))
 
 from twilight.config import NBEATSxConfig
@@ -302,18 +310,15 @@ def get_hist_futr_exog(cfg):
     underperform simple lags. Keep FeatureBuilder for grid construction +
     twilight_cos (futr), add lag features manually after transform.
     """
+    # Set A — feature sweep winner (greedy forward, max_steps=1000, width=256).
+    # Beats current 11-feature set by ~10% RMSE at 3h/9h/12h with +3pp pct<1°C.
     hist_exog = [
-        "y_raw",             # absolute temperature
-        "y_lag_6",           # 3h ago
-        "y_lag_24",          # 12h ago (the reconstruction anchor)
-        "y_lag_48",          # 24h ago
-        "y_lag_96",          # 2 days ago
-        "trend_solar_2h",   # backward OLS slope
-        "y_diff_60",        # temp change over 30h (1.25 days) — best for Spring
-        "cooling_rate_3h",  # (y[t] - y[t-6]) / 6
-        "dmean_1d",         # 24h mean change over 1 day
-        "dmean_3d",         # 24h mean change over 3 days
-        "last_std_24h",     # rolling std over last 24h
+        "y_raw",                       # absolute temperature
+        "y_lag_24",                    # 12h ago (reconstruction anchor)
+        "trend_solar_2h",              # backward OLS slope (~2h)
+        "dmean_3d",                    # 24h mean change over 3 days
+        "y_diff_60",                   # temp change over 30h — best for Spring
+        "rate_twilight_to_midnight",   # nighttime cooling rate (T_mn - T_tw)/(night/2)
     ]
     futr_exog = ["solar_sin", "solar_cos", "doy_sin", "doy_cos"]
     if globals().get("USE_MB", True):
@@ -367,7 +372,6 @@ def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt", 
         n_blocks=[1, 1, 1, 1],
         early_stop_patience_steps=10,
         val_check_steps=50,
-        accelerator=os.environ.get("RUN_ACCEL", "gpu"), devices=1,
     )
 
     nf = NeuralForecast(models=[model], freq=SOLAR_GRID_FREQ)
@@ -849,9 +853,11 @@ def main():
                 lt1 = (subset["error"].abs() < 1.0).mean() * 100
                 print(f"{lead_h:10.1f} {rmse:8.3f} {mae:8.3f} {bias:+8.3f} {len(subset):6d} {lt1:5.1f}%")
 
-    # Save
+    # Save — naming follows plot_nwp_comparison.py convention:
+    #   no-MB → paper_results_diff.csv  (headline NBEATSx-Blend)
+    #   --mb  → paper_results_diff_nwp.csv  (NWP variant)
     RESULTS_PATH.mkdir(parents=True, exist_ok=True)
-    suffix = "_mb" if globals().get("USE_MB", False) else ""
+    suffix = "_nwp" if globals().get("USE_MB", False) else ""
     output_file = RESULTS_PATH / f"paper_results_diff{suffix}.csv"
     all_results = pd.concat([results, blended_results], ignore_index=True)
     all_results.to_csv(output_file, index=False)

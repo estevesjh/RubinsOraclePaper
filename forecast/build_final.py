@@ -23,7 +23,15 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"))
+_TWILIGHT_CANDIDATES = [
+    os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"),  # slacd convention
+    "/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast",
+    os.path.join(_REPO_ROOT, "..", "rubin-twilight-forecast"),    # local sibling repo
+]
+for _p in _TWILIGHT_CANDIDATES:
+    if os.path.isdir(os.path.join(_p, "twilight")):
+        sys.path.insert(0, os.path.abspath(_p))
+        break
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (
@@ -34,15 +42,13 @@ from config import (
 from run import load_and_prepare, find_twilight_targets, lead_hours_to_steps
 
 
-def main(use_mb=False):
-    suffix = "_mb" if use_mb else ""
-    blend_model_name = "NBEATSx-Ridge-MB" if use_mb else "NBEATSx-Ridge"
+def main():
     print("=" * 60)
-    print(f"BUILD paper_results_final{suffix}.csv  (use_mb={use_mb})")
+    print("BUILD paper_results_final.csv")
     print("=" * 60)
 
     # 1. Load NBEATSx results from run.py
-    nb_file = RESULTS_PATH / f"paper_results_diff{suffix}.csv"
+    nb_file = RESULTS_PATH / "paper_results_diff.csv"
     nb_raw = pd.read_csv(nb_file)
     nb_diff = nb_raw[nb_raw["model"] == "NBEATSx-Diff"].copy()
     # Ensure 12h lead exists (copy 11.5h if missing)
@@ -171,33 +177,60 @@ def main(use_mb=False):
     # 5. Blend NBEATSx + Linear (optimal alpha per lead) → NBEATSx-Ridge
     print("\n5. Blending NBEATSx + Linear (per-lead alpha)...")
     lr_df = baseline_df[baseline_df["model"] == "Linear"]
-    nb_diff["twilight_time"] = pd.to_datetime(nb_diff["twilight_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
-    merged = nb_diff.merge(lr_df[["twilight_time", "lead_time_hours", "forecast_temp"]],
-                           on=["twilight_time", "lead_time_hours"], suffixes=("_nb", "_lr"), how="inner")
-    blend_rows = []
-    for lead_h in sorted(merged["lead_time_hours"].unique()):
-        sub = merged[merged["lead_time_hours"] == lead_h]
-        T_nb = sub["forecast_temp_nb"].values
-        T_lr = sub["forecast_temp_lr"].values
-        T_act = sub["actual_temp"].values
-        res = minimize_scalar(lambda a: np.sqrt(((T_act - (a * T_lr + (1 - a) * T_nb)) ** 2).mean()),
-                              bounds=(0, 1), method="bounded")
-        T_blend = res.x * T_lr + (1 - res.x) * T_nb
-        for i, (_, row) in enumerate(sub.iterrows()):
-            blend_rows.append({
-                "twilight_time": row["twilight_time"], "forecast_time": row["forecast_time"],
-                "lead_time_hours": lead_h, "actual_temp": T_act[i],
-                "model": blend_model_name, "forecast_temp": T_blend[i],
-                "error": T_act[i] - T_blend[i],
-            })
-    # Add non-overlapping NBEATSx rows as-is
-    nb_only = nb_diff[~nb_diff.set_index(["twilight_time", "lead_time_hours"]).index.isin(
-        merged.set_index(["twilight_time", "lead_time_hours"]).index)]
-    for _, row in nb_only.iterrows():
-        blend_rows.append({**row.to_dict(), "model": blend_model_name})
-    blend_df = pd.DataFrame(blend_rows)
+
+    def blend_with_linear(nb_in, model_name):
+        """Per-lead optimal blend of NBEATSx-Diff with Linear baseline."""
+        nb_in = nb_in.copy()
+        nb_in["twilight_time"] = pd.to_datetime(
+            nb_in["twilight_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
+        merged = nb_in.merge(
+            lr_df[["twilight_time", "lead_time_hours", "forecast_temp"]],
+            on=["twilight_time", "lead_time_hours"],
+            suffixes=("_nb", "_lr"), how="inner")
+        rows = []
+        for lead_h in sorted(merged["lead_time_hours"].unique()):
+            sub = merged[merged["lead_time_hours"] == lead_h]
+            T_nb = sub["forecast_temp_nb"].values
+            T_lr = sub["forecast_temp_lr"].values
+            T_act = sub["actual_temp"].values
+            res = minimize_scalar(
+                lambda a: np.sqrt(((T_act - (a * T_lr + (1 - a) * T_nb)) ** 2).mean()),
+                bounds=(0, 1), method="bounded")
+            T_blend = res.x * T_lr + (1 - res.x) * T_nb
+            for i, (_, row) in enumerate(sub.iterrows()):
+                rows.append({
+                    "twilight_time": row["twilight_time"],
+                    "forecast_time": row["forecast_time"],
+                    "lead_time_hours": lead_h, "actual_temp": T_act[i],
+                    "model": model_name, "forecast_temp": T_blend[i],
+                    "error": T_act[i] - T_blend[i],
+                })
+        # Carry through any leads where Linear baselines aren't available
+        nb_only = nb_in[~nb_in.set_index(["twilight_time", "lead_time_hours"]).index.isin(
+            merged.set_index(["twilight_time", "lead_time_hours"]).index)]
+        for _, row in nb_only.iterrows():
+            rows.append({**row.to_dict(), "model": model_name})
+        return pd.DataFrame(rows)
+
+    blend_df = blend_with_linear(nb_diff, "NBEATSx-Ridge")
     rmse_3h = np.sqrt((blend_df[blend_df["lead_time_hours"] == 3.0]["error"] ** 2).mean())
-    print(f"   Blend RMSE at 3h: {rmse_3h:.3f}, rows: {len(blend_df)}")
+    print(f"   NBEATSx-Ridge (no-MB) RMSE at 3h: {rmse_3h:.3f}, rows: {len(blend_df)}")
+
+    # Optional with-MB variant: read paper_results_diff_nwp.csv if present.
+    nwp_file = RESULTS_PATH / "paper_results_diff_nwp.csv"
+    blend_mb_df = pd.DataFrame()
+    if nwp_file.exists():
+        nb_mb_raw = pd.read_csv(nwp_file)
+        nb_mb_diff = nb_mb_raw[nb_mb_raw["model"] == "NBEATSx-Diff"].copy()
+        if 12.0 not in nb_mb_diff["lead_time_hours"].values and 11.5 in nb_mb_diff["lead_time_hours"].values:
+            nb_12h = nb_mb_diff[nb_mb_diff["lead_time_hours"] == 11.5].copy()
+            nb_12h["lead_time_hours"] = 12.0
+            nb_mb_diff = pd.concat([nb_mb_diff, nb_12h], ignore_index=True)
+        blend_mb_df = blend_with_linear(nb_mb_diff, "NBEATSx-Ridge-MB")
+        rmse_mb_3h = np.sqrt((blend_mb_df[blend_mb_df["lead_time_hours"] == 3.0]["error"] ** 2).mean())
+        print(f"   NBEATSx-Ridge-MB RMSE at 3h: {rmse_mb_3h:.3f}, rows: {len(blend_mb_df)}")
+    else:
+        print(f"   {nwp_file.name} not found — skipping NWP variant.")
 
     # 6. Prophet + MeteoBlue
     print("\n6. Adding Prophet + MeteoBlue...")
@@ -209,17 +242,12 @@ def main(use_mb=False):
     mb_df = aef.process_meteoblue_forecasts(tw_for_ext)
 
     # 7. Combine and save
-    out_path = RESULTS_PATH / f"paper_results_final{suffix}.csv"
-    print(f"\n7. Saving {out_path.name}...")
-    if use_mb:
-        # MB run: only emit the MB-flavored blend (avoid duplicating baselines/persist/prophet/MB)
-        combined = blend_df.copy()
-    else:
-        combined = pd.concat([blend_df, baseline_df, persist_df, prophet_df, mb_df], ignore_index=True)
+    print("\n7. Saving paper_results_final.csv...")
+    combined = pd.concat([blend_df, blend_mb_df, baseline_df, persist_df, prophet_df, mb_df], ignore_index=True)
     # Standardize timestamps
     combined["twilight_time"] = pd.to_datetime(combined["twilight_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
     combined["forecast_time"] = pd.to_datetime(combined["forecast_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
-    combined.to_csv(str(out_path), index=False)
+    combined.to_csv(str(RESULTS_PATH / "paper_results_final.csv"), index=False)
     print(f"   Saved: {len(combined)} rows")
     for m in sorted(combined["model"].unique()):
         sub = combined[(combined["model"] == m) & ((combined["lead_time_hours"] - 3.0).abs() < 0.25)]
@@ -230,9 +258,4 @@ def main(use_mb=False):
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mb", action="store_true",
-                        help="Process the MeteoBlue-augmented run (paper_results_diff_mb.csv)")
-    args = parser.parse_args()
-    main(use_mb=args.mb)
+    main()

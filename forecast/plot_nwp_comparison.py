@@ -152,7 +152,9 @@ def main():
     ax1.set_ylabel("RMSE (°C)", fontsize=12)
     ax1.set_title("RMSE (90% CI)", fontsize=12)
     style_lead_axis(ax1)
-    ax1.set_ylim(0.5, 1.4)
+    rmse_min = float(np.nanmin([np.nanmin(lo_bn), np.nanmin(lo_bl)]))
+    rmse_max = float(np.nanmax([np.nanmax(hi_bn), np.nanmax(hi_bl), 1.0]))
+    ax1.set_ylim(max(0.0, rmse_min - 0.05), rmse_max + 0.10)
     leg1 = ax1.legend(fontsize=10, loc="lower left",
                       title=r"Top axis: solar fraction $\phi$ (0 sunrise, 0.5 sunset)",
                       title_fontsize=9)
@@ -166,7 +168,10 @@ def main():
     ax2.set_ylabel("|Error| 95th percentile (°C)", fontsize=12)
     ax2.set_title("95th Percentile |Error| (90% CI)", fontsize=12)
     style_lead_axis(ax2)
-    ax2.set_ylim(0.5, 3.2)
+    # Auto-fit p95 y-axis to actual data with a small margin.
+    p95_min = float(np.nanmin([np.nanmin(p95lo_bn), np.nanmin(p95lo_bl)]))
+    p95_max = float(np.nanmax([np.nanmax(p95hi_bn), np.nanmax(p95hi_bl), 1.0]))
+    ax2.set_ylim(max(0.0, p95_min - 0.10), p95_max + 0.15)
     ax2.legend(fontsize=10, loc="lower left",
                title=r"Top axis: solar fraction $\phi$ (0 sunrise, 0.5 sunset)",
                title_fontsize=9)

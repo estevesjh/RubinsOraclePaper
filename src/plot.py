@@ -139,7 +139,7 @@ def fig0_dataset_overview():
         # 6. Get twilight and sunrise events for the window (in local time)
         # Derive sunrises from alt_sun crossing 0 from below (new CSV has no sunrise_temp column).
         if "sunrise_temp" not in df.columns:
-            alt_sun = pd.to_numeric(df["alt_sun"], errors="coerce").fillna(method="ffill")
+            alt_sun = pd.to_numeric(df["alt_sun"], errors="coerce").ffill()
             sunrise_mask = (alt_sun.shift(1) < 0) & (alt_sun >= 0)
         else:
             sunrise_mask = df["sunrise_temp"].notna()
@@ -1434,6 +1434,9 @@ def fig8_comparison_nbeats_prophet_meteoblue():
         ss_res = float(np.sum((yi - yhat_fit) ** 2)) if n_in > 0 else np.nan
         ss_tot = float(np.sum((yi - np.mean(yi)) ** 2)) if n_in > 0 else np.nan
         r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+        # RMSE on ALL points (matches fig3/fig5/table1 conventions); Std$_*$
+        # above is bias-subtracted scatter on 3σ inliers.
+        rmse_all = float(np.sqrt(np.mean((y - x) ** 2))) if x.size > 0 else np.nan
 
         # Stats text box (Std is residual std about the fit, i.e. bias-removed)
         txt = (
@@ -1441,6 +1444,7 @@ def fig8_comparison_nbeats_prophet_meteoblue():
             f"Slope = {b:.2f}\n"
             f"Bias = {bias:.2f} °C\n"
             f"Std$_*$ = {std:.2f} °C\n"
+            f"RMSE = {rmse_all:.2f} °C\n"
             f"R² = {r2:.2f}\n"
             f"$_*$bias-subtracted"
         )

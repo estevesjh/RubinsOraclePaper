@@ -67,7 +67,7 @@ def handle_prophet_failures(
     fail_long = np.abs(xi2_long - 1.0) > xi2_tol
     fail_short = np.abs(xi2_short - 1.0) > xi2_tol
 
-    yhat_new = out["y_hat"].to_numpy(dtype=float)
+    yhat_new = out["y_hat"].to_numpy(dtype=float, copy=True)
 
     only_long_fail = fail_long & ~fail_short
     yhat_new[only_long_fail] = out.loc[only_long_fail, "yhat_short"].to_numpy(dtype=float)
@@ -107,7 +107,8 @@ def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
     # Load Prophet data with BMA blending (short + long term models)
     df = pd.read_csv(PROPHET_FILE)
     df = df.rename(columns={"timestamp": "valid_time"})
-    df["valid_time"] = pd.to_datetime(df["valid_time"])
+    # Force ns resolution: pandas 3.x defaults to [us], breaking int64 round-trips
+    df["valid_time"] = pd.to_datetime(df["valid_time"]).astype("datetime64[ns]")
     # Apply blending only where component columns exist
     has_components = "yhat_short" in df.columns and df["yhat_short"].notna().any()
     if has_components:
@@ -120,7 +121,7 @@ def process_prophet_forecasts(twilight_events: pd.DataFrame) -> pd.DataFrame:
 
     # Get twilight events
     twilight_events = twilight_events.copy()
-    twilight_events["twilight_time"] = pd.to_datetime(twilight_events["twilight_time"])
+    twilight_events["twilight_time"] = pd.to_datetime(twilight_events["twilight_time"]).astype("datetime64[ns]")
 
     results = []
     for lt in TARGET_LEAD_TIMES:

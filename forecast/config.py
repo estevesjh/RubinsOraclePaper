@@ -6,7 +6,9 @@ import pandas as pd
 
 # Paths
 ROOT_PATH = Path(__file__).parent.parent
-DATA_PATH = ROOT_PATH / "data" / "temp_history_jan2026_with_weather.csv"
+_SDF_DATA = Path("/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast/data/temp_history_jan2026_with_weather.csv")
+_LOCAL_DATA = ROOT_PATH / "data" / "temp_history_jan2026_with_weather.csv"
+DATA_PATH = _SDF_DATA if _SDF_DATA.exists() else _LOCAL_DATA
 RESULTS_PATH = ROOT_PATH / "results"
 MODEL_CACHE_PATH = RESULTS_PATH / "nbeats_diff_cache"
 FIGURES_PATH = ROOT_PATH / "figures"
@@ -27,7 +29,7 @@ SOLAR_GRID_FREQ = "1800s"
 # NBEATSx model
 NBEATS_INPUT_SIZE = 48        # 1 solar day lookback
 NBEATS_HORIZON = 26           # covers up to 12h lead
-NBEATS_MAX_STEPS = 500
+NBEATS_MAX_STEPS = 2000       # max_steps sweep showed monotonic RMSE gains to 2000 (early-stop guards overfit)
 
 # Evaluation lead times (0.5h steps, max 12h due to 12h differencing anchor)
 LEAD_TIMES_HOURS = list(np.arange(0.5, 12.5, 0.5))

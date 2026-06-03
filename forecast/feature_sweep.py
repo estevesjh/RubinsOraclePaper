@@ -134,28 +134,84 @@ def compute_all_features(grid):
     grid["dDTR_1d"] = dtr_today - dtr_yesterday
     grid.iloc[:96, grid.columns.get_loc("dDTR_1d")] = np.nan
 
+    # ── Additional lags / diffs ──
+    grid["y_lag_3"] = pd.Series(y_arr).shift(3).values        # 1.5h ago
+    grid["y_lag_96"] = pd.Series(y_arr).shift(96).values      # 2 days ago
+    grid["y_diff_72h"] = y_arr - np.roll(y_arr, 144)          # 3-day diff
+    grid.iloc[:144, grid.columns.get_loc("y_diff_72h")] = np.nan
+    # NOTE: y_diff_30h (60 steps) already computed above; keep that canonical name.
+
+    # ── Longer / shorter cooling + trend windows ──
+    grid["cooling_rate_6h"] = (y_arr - np.roll(y_arr, 12)) / 12.0
+    grid.iloc[:12, grid.columns.get_loc("cooling_rate_6h")] = np.nan
+
+    window = 12  # 6h backward OLS slope
+    slopes_6h = np.full(n, np.nan)
+    x = np.arange(window, dtype=float)
+    x_mean = x.mean()
+    var_x = ((x - x_mean) ** 2).sum()
+    for i in range(window, n):
+        seg = y_arr[i - window:i]
+        if np.isnan(seg).any():
+            continue
+        cov = ((x - x_mean) * (seg - seg.mean())).sum()
+        slopes_6h[i] = cov / var_x
+    grid["trend_solar_6h"] = slopes_6h
+
+    # ── Trend acceleration (2nd derivative): change in 2h slope over 2h ──
+    if "trend_solar_2h" in grid.columns:
+        t2 = grid["trend_solar_2h"].values
+        grid["trend_accel"] = t2 - np.roll(t2, 4)
+        grid.iloc[:4, grid.columns.get_loc("trend_accel")] = np.nan
+
+    # ── max_minus_sunrise (memory: strongest Ridge feature) ──
+    # Recompute defensively in case load_and_prepare variant lacks it.
+    if "max_minus_sunrise" not in grid.columns:
+        if "last_max_temp" in grid.columns and "temp_last_sunrise" in grid.columns:
+            grid["max_minus_sunrise"] = (
+                grid["last_max_temp"].values - grid["temp_last_sunrise"].values
+            )
+
+    # ── Nonlinear self-terms (memory: res_age² / squared signals help) ──
+    if "max_minus_sunrise" in grid.columns:
+        grid["maxsr_sq"] = grid["max_minus_sunrise"].values ** 2
+    if "DTR" in grid.columns:
+        grid["DTR_sq"] = grid["DTR"].values ** 2
+
+    # ── Interaction: trend strength modulated by season ──
+    if "trend_solar_2h" in grid.columns and "doy_cos" in grid.columns:
+        grid["trend_x_doy"] = grid["trend_solar_2h"].values * grid["doy_cos"].values
+
     return grid
 
 
 # All candidate feature names
 ALL_CANDIDATES = [
     # Current
-    "y_raw", "y_lag_6", "y_lag_12", "y_lag_24", "y_lag_48",
+    "y_raw", "y_lag_3", "y_lag_6", "y_lag_12", "y_lag_24", "y_lag_48", "y_lag_96",
     "trend_solar_2h", "DTR",
     # Rolling stats
     "last_max_24h", "last_min_24h", "last_mean_24h", "last_std_24h",
     # Multi-day diffs
     "dmean_1d", "dmean_3d",
     # Rates
-    "trend_solar_4h", "cooling_rate_3h",
+    "trend_solar_4h", "trend_solar_6h", "trend_accel",
+    "cooling_rate_3h", "cooling_rate_6h",
     # Diurnal diffs
-    "y_diff_24h", "y_diff_48h",
-    # Long-term trend (Spring residual correlations)
+    "y_diff_24h", "y_diff_48h", "y_diff_72h",
+    # Long-term trend (Spring residual correlations: 30h = best for Spring)
     "y_diff_30h", "y_diff_39h", "y_diff_45h",
     # Solar anchors
     "y_sunrise", "y_midday", "y_midafternoon", "y_sunset", "y_midnight",
     # DTR variants
     "DTR_3d", "dDTR_1d",
+    # FeatureBuilder columns (previously not swept)
+    "max_minus_sunrise", "temp_last_sunrise", "temp_last_midday", "temp_last_midnight",
+    "temp_solar_noon", "dTmax_1d", "dTmax_3d", "temp_trend_3d", "Tmean_24h",
+    "rate_sunrise_to_midday", "rate_midday_to_twilight", "rate_twilight_to_midnight",
+    "rate_midnight_to_sunrise", "velocity_sunrise", "velocity_noon",
+    # Nonlinear / interaction terms (memory: squared signals + season interactions help)
+    "maxsr_sq", "DTR_sq", "trend_x_doy",
 ]
 
 FUTR_EXOG = ["solar_sin", "solar_cos", "doy_sin", "doy_cos"]
@@ -181,7 +237,7 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
     val_size = int(len(nf_train) * 0.1)
 
     accel = os.environ.get("FS_ACCEL", "gpu")
-    width = [int(x) for x in os.environ.get("FS_WIDTH", "32,32").split(",")]
+    width = [int(x) for x in os.environ.get("FS_WIDTH", "256,256").split(",")]
     model = NBEATSx(
         h=NBEATS_HORIZON, input_size=NBEATS_INPUT_SIZE, max_steps=max_steps,
         hist_exog_list=hist_exog, futr_exog_list=futr_exog,
@@ -190,7 +246,7 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
         enable_model_summary=False,
         stack_types=["trend", "seasonality", "identity", "exogenous"],
         mlp_units=4 * [width], n_blocks=[1, 1, 1, 1],
-        early_stop_patience_steps=5, val_check_steps=20,
+        early_stop_patience_steps=10, val_check_steps=50,
         accelerator=accel, devices=1,
     )
 
@@ -337,10 +393,10 @@ def main():
 
     # ── Phase 2: Forward selection (parallelized) ──
     print("\n" + "=" * 70)
-    print("PHASE 2: Forward selection (max_steps=100, parallel)")
+    print("PHASE 2: Forward selection (max_steps=1000, width=256)")
     print("=" * 70)
 
-    MAX_STEPS = int(os.environ.get("FS_MAX_STEPS", 50))
+    MAX_STEPS = int(os.environ.get("FS_MAX_STEPS", 1000))
     max_feats = os.environ.get("FS_MAX_FEATS")
     if max_feats is not None:
         max_feats = int(max_feats)
@@ -390,19 +446,57 @@ def main():
             break
 
         # Selection: lowest RMSE; ties broken by higher pct<1C
-        best_feat, best_rmse, best_pct, _ = min(
-            valid_results, key=lambda x: (x[1], -x[2]))
+        ranked = sorted(valid_results, key=lambda x: (x[1], -x[2]))
+        best_feat, best_rmse, best_pct, _ = ranked[0]
 
         if best_rmse >= current_rmse - 0.005:
             print(f"\n   No improvement (RMSE) found. Stopping.")
             break
 
-        current_best.append(best_feat)
-        remaining.remove(best_feat)
+        # ── Correlation gate for co-adding: take runners-up that ALSO improve
+        # the model AND are weakly correlated (|r| < CORR_THRESHOLD) with the
+        # round's winner AND with each other. Decorrelated features carry
+        # complementary signal; correlated ones are redundant after the winner.
+        # Disabled by default; enable with FS_COADD=1.
+        co_added = []
+        if os.environ.get("FS_COADD") == "1":
+            TOP_K = int(os.environ.get("FS_COADD_TOPK", 3))
+            CORR_THRESHOLD = float(os.environ.get("FS_COADD_THRESH", 0.7))
+            winner_col = grid[best_feat].values
+            accepted_cols = [winner_col]
+            for cand_feat, cand_rmse, cand_pct, _ in ranked[1:TOP_K]:
+                if cand_rmse >= current_rmse - 0.005:
+                    break  # candidate doesn't improve baseline → stop
+                cand_col = grid[cand_feat].values
+                max_abs_r = 0.0
+                for ref_col in accepted_cols:
+                    mask = ~(np.isnan(cand_col) | np.isnan(ref_col))
+                    if mask.sum() < 100:
+                        continue
+                    r = np.corrcoef(cand_col[mask], ref_col[mask])[0, 1]
+                    if np.isfinite(r):
+                        max_abs_r = max(max_abs_r, abs(r))
+                tag = "ACCEPT" if max_abs_r < CORR_THRESHOLD else "skip(corr)"
+                print(f"   ↳ co-add check {cand_feat:>20}: RMSE={cand_rmse:.3f}, "
+                      f"max|r|={max_abs_r:.2f} → {tag}")
+                if max_abs_r < CORR_THRESHOLD:
+                    co_added.append((cand_feat, cand_rmse, cand_pct))
+                    accepted_cols.append(cand_col)
+
+        # Commit winner + any decorrelated co-adds.
+        added_this_round = [best_feat] + [f for f, _, _ in co_added]
+        for feat in added_this_round:
+            current_best.append(feat)
+            remaining.remove(feat)
         current_rmse = best_rmse
         current_pct = best_pct
-        print(f"   → Added '{best_feat}': new RMSE={current_rmse:.3f} "
-              f"pct<1C={current_pct*100:.1f}%")
+        if co_added:
+            print(f"   → Added '{best_feat}' + {[f for f, _, _ in co_added]} "
+                  f"(decorrelated co-adds): RMSE≥{current_rmse:.3f} "
+                  f"pct<1C≥{current_pct*100:.1f}%")
+        else:
+            print(f"   → Added '{best_feat}': new RMSE={current_rmse:.3f} "
+                  f"pct<1C={current_pct*100:.1f}%")
 
     print("\n" + "=" * 70)
     print("RESULT: Optimal feature set")

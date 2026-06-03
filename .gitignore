@@ -223,3 +223,4 @@ docs/spie_paper.pdf
 # Local SSH key copies (NEVER commit)
 id_ed25519
 id_ed25519.pub
+*.blg
