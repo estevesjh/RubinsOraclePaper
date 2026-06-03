@@ -30,7 +30,8 @@ import numpy as np
 import pandas as pd
 
 # Add rubin-twilight-forecast to path for FeatureBuilder
-sys.path.insert(0, "/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from twilight.config import NBEATSxConfig
@@ -362,10 +363,11 @@ def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt", 
         enable_progress_bar=True,
         enable_model_summary=False,
         stack_types=["trend", "seasonality", "identity", "exogenous"],
-        mlp_units=4 * [[32, 32]],
+        mlp_units=4 * [[int(x) for x in os.environ.get("RUN_WIDTH", "256,256").split(",")]],
         n_blocks=[1, 1, 1, 1],
         early_stop_patience_steps=10,
         val_check_steps=50,
+        accelerator=os.environ.get("RUN_ACCEL", "gpu"), devices=1,
     )
 
     nf = NeuralForecast(models=[model], freq=SOLAR_GRID_FREQ)
@@ -849,7 +851,8 @@ def main():
 
     # Save
     RESULTS_PATH.mkdir(parents=True, exist_ok=True)
-    output_file = RESULTS_PATH / "paper_results_diff.csv"
+    suffix = "_mb" if globals().get("USE_MB", False) else ""
+    output_file = RESULTS_PATH / f"paper_results_diff{suffix}.csv"
     all_results = pd.concat([results, blended_results], ignore_index=True)
     all_results.to_csv(output_file, index=False)
     print(f"\nResults saved to {output_file}")

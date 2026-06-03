@@ -106,39 +106,72 @@ def main():
         lo, hi = bootstrap_stat(err_local, p95_fn)
         p95lo_bl.append(lo); p95hi_bl.append(hi)
 
-    # Plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
-    fig.suptitle("Impact of Adding MeteoBlue NWP Forecast as Exogenous Feature", fontsize=14, y=0.98)
+    # Plot — paper-consistent palette: NBEATSx-Blend = navy, +NWP = teal
+    color_local = "#023e8a"
+    color_nwp = "#06d6a0"
+
+    # Forecast target = astro. twilight (alt_sun = -20°) ~ 1h20min after sunset.
+    # By the paper's solar-time definition with night length 12h on the equinox,
+    # phi_tw = 0.5 + (1.33/12)*0.5 ~ 0.555 (NOT 0.58). On the equinox this is
+    # 6am + 0.555*24h = 7:20pm. Mappings (equinox):
+    #   clock_h = 19.33 - lead_h ;   phi = 0.555 - lead_h / 24.
+    PHI_TWILIGHT = 0.555
+    CLOCK_TWILIGHT = 6.0 + PHI_TWILIGHT * 24.0  # = 19.32 h on the equinox
+    clock_to_lead = lambda h: CLOCK_TWILIGHT - h
+    phi_to_lead = lambda phi: 24.0 * (PHI_TWILIGHT - phi)
+    clock_ticks_h = [8, 10, 12, 14, 16, 18, CLOCK_TWILIGHT]
+    clock_labels = ["8am", "10am", "12pm", "2pm", "4pm", "6pm", "astro.\ntwilight"]
+    # Solar fraction equivalent of each clock tick on the equinox: phi = (clock - 6) / 24
+    phi_ticks = [(h - 6.0) / 24.0 for h in clock_ticks_h[:-1]] + [PHI_TWILIGHT]
+    phi_labels = [f"{p:.3f}" for p in phi_ticks]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.8))
+    fig.suptitle("Impact of Adding MeteoBlue NWP Forecast as Exogenous Feature", fontsize=14, y=0.99)
+
+    def style_lead_axis(ax):
+        """Apply dual lead-time axis: clock time on bottom, solar fraction phi on top."""
+        ax.set_xlim(0, 13)
+        ax.set_xticks([clock_to_lead(h) for h in clock_ticks_h])
+        ax.set_xticklabels(clock_labels)
+        ax.invert_xaxis()  # so morning (large lead) is on the LEFT and twilight on the right
+        ax.set_xlabel("Local time at forecast issuance (Cerro Pachón)", fontsize=12)
+        ax_top = ax.twiny()
+        ax_top.set_xlim(ax.get_xlim())  # follow the inverted axis
+        ax_top.set_xticks([phi_to_lead(p) for p in phi_ticks])
+        ax_top.set_xticklabels(phi_labels)
+        ax_top.set_xlabel(r"Solar-time fraction $\phi$", fontsize=11)
+        ax_top.tick_params(axis="x", direction="in", which="both")
+        ax.grid(True, alpha=0.3)
 
     # Left: RMSE
-    ax1.fill_between(leads, lo_bn, hi_bn, color="#023e8a", alpha=0.15)
-    ax1.fill_between(leads, lo_bl, hi_bl, color="#e63946", alpha=0.15)
-    ax1.plot(leads, rmse_bn, "o-", color="#023e8a", lw=2.5, label="NBEATSx-Blend + NWP")
-    ax1.plot(leads, rmse_bl, "s-", color="#e63946", lw=2, label="NBEATSx-Blend Local")
+    ax1.fill_between(leads, lo_bn, hi_bn, color=color_nwp, alpha=0.15)
+    ax1.fill_between(leads, lo_bl, hi_bl, color=color_local, alpha=0.15)
+    ax1.plot(leads, rmse_bn, "o-", color=color_nwp, lw=2.5, label="NBEATSx-Blend + NWP")
+    ax1.plot(leads, rmse_bl, "s-", color=color_local, lw=2, label="NBEATSx-Blend Local")
     ax1.axhline(1.0, color="orange", ls="--", alpha=0.5)
-    ax1.set_xlabel("Lead time (hours)", fontsize=12)
     ax1.set_ylabel("RMSE (°C)", fontsize=12)
-    ax1.set_title("RMSE vs Lead Time (90% CI)", fontsize=12)
-    ax1.legend(fontsize=11, loc="lower right")
-    ax1.set_xlim(0, 13)
-    ax1.set_ylim(0.2, 1.6)
-    ax1.grid(True, alpha=0.3)
+    ax1.set_title("RMSE (90% CI)", fontsize=12)
+    style_lead_axis(ax1)
+    ax1.set_ylim(0.5, 1.4)
+    leg1 = ax1.legend(fontsize=10, loc="lower left",
+                      title=r"Top axis: solar fraction $\phi$ (0 sunrise, 0.5 sunset)",
+                      title_fontsize=9)
 
-    # Right: p95
-    ax2.fill_between(leads, p95lo_bn, p95hi_bn, color="#023e8a", alpha=0.15)
-    ax2.fill_between(leads, p95lo_bl, p95hi_bl, color="#e63946", alpha=0.15)
-    ax2.plot(leads, p95_bn, "o-", color="#023e8a", lw=2.5, label="NBEATSx-Blend + NWP")
-    ax2.plot(leads, p95_bl, "s-", color="#e63946", lw=2, label="NBEATSx-Blend Local")
+    # Right: p95 — same y-axis as before
+    ax2.fill_between(leads, p95lo_bn, p95hi_bn, color=color_nwp, alpha=0.15)
+    ax2.fill_between(leads, p95lo_bl, p95hi_bl, color=color_local, alpha=0.15)
+    ax2.plot(leads, p95_bn, "o-", color=color_nwp, lw=2.5, label="NBEATSx-Blend + NWP")
+    ax2.plot(leads, p95_bl, "s-", color=color_local, lw=2, label="NBEATSx-Blend Local")
     ax2.axhline(1.0, color="orange", ls="--", alpha=0.5)
-    ax2.set_xlabel("Lead time (hours)", fontsize=12)
     ax2.set_ylabel("|Error| 95th percentile (°C)", fontsize=12)
-    ax2.set_title("95th Percentile |Error| vs Lead Time (90% CI)", fontsize=12)
-    ax2.legend(fontsize=11, loc="lower right")
-    ax2.set_xlim(0, 13)
+    ax2.set_title("95th Percentile |Error| (90% CI)", fontsize=12)
+    style_lead_axis(ax2)
     ax2.set_ylim(0.5, 3.2)
-    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=10, loc="lower left",
+               title=r"Top axis: solar fraction $\phi$ (0 sunrise, 0.5 sunset)",
+               title_fontsize=9)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(FIGURES_PATH / "fig_rmse_nwp_vs_local.png", dpi=150)
     fig.savefig(FIGURES_PATH / "fig_rmse_nwp_vs_local.pdf", dpi=150)
     plt.close()

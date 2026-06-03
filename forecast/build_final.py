@@ -22,7 +22,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
-sys.path.insert(0, "/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (
@@ -33,13 +34,15 @@ from config import (
 from run import load_and_prepare, find_twilight_targets, lead_hours_to_steps
 
 
-def main():
+def main(use_mb=False):
+    suffix = "_mb" if use_mb else ""
+    blend_model_name = "NBEATSx-Ridge-MB" if use_mb else "NBEATSx-Ridge"
     print("=" * 60)
-    print("BUILD paper_results_final.csv")
+    print(f"BUILD paper_results_final{suffix}.csv  (use_mb={use_mb})")
     print("=" * 60)
 
     # 1. Load NBEATSx results from run.py
-    nb_file = RESULTS_PATH / "paper_results_diff.csv"
+    nb_file = RESULTS_PATH / f"paper_results_diff{suffix}.csv"
     nb_raw = pd.read_csv(nb_file)
     nb_diff = nb_raw[nb_raw["model"] == "NBEATSx-Diff"].copy()
     # Ensure 12h lead exists (copy 11.5h if missing)
@@ -184,14 +187,14 @@ def main():
             blend_rows.append({
                 "twilight_time": row["twilight_time"], "forecast_time": row["forecast_time"],
                 "lead_time_hours": lead_h, "actual_temp": T_act[i],
-                "model": "NBEATSx-Ridge", "forecast_temp": T_blend[i],
+                "model": blend_model_name, "forecast_temp": T_blend[i],
                 "error": T_act[i] - T_blend[i],
             })
     # Add non-overlapping NBEATSx rows as-is
     nb_only = nb_diff[~nb_diff.set_index(["twilight_time", "lead_time_hours"]).index.isin(
         merged.set_index(["twilight_time", "lead_time_hours"]).index)]
     for _, row in nb_only.iterrows():
-        blend_rows.append({**row.to_dict(), "model": "NBEATSx-Ridge"})
+        blend_rows.append({**row.to_dict(), "model": blend_model_name})
     blend_df = pd.DataFrame(blend_rows)
     rmse_3h = np.sqrt((blend_df[blend_df["lead_time_hours"] == 3.0]["error"] ** 2).mean())
     print(f"   Blend RMSE at 3h: {rmse_3h:.3f}, rows: {len(blend_df)}")
@@ -206,23 +209,30 @@ def main():
     mb_df = aef.process_meteoblue_forecasts(tw_for_ext)
 
     # 7. Combine and save
-    print("\n7. Saving paper_results_final.csv...")
-    combined = pd.concat([blend_df, baseline_df, persist_df, prophet_df, mb_df], ignore_index=True)
+    out_path = RESULTS_PATH / f"paper_results_final{suffix}.csv"
+    print(f"\n7. Saving {out_path.name}...")
+    if use_mb:
+        # MB run: only emit the MB-flavored blend (avoid duplicating baselines/persist/prophet/MB)
+        combined = blend_df.copy()
+    else:
+        combined = pd.concat([blend_df, baseline_df, persist_df, prophet_df, mb_df], ignore_index=True)
     # Standardize timestamps
     combined["twilight_time"] = pd.to_datetime(combined["twilight_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
     combined["forecast_time"] = pd.to_datetime(combined["forecast_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
-    combined.to_csv(str(RESULTS_PATH / "paper_results_final.csv"), index=False)
+    combined.to_csv(str(out_path), index=False)
     print(f"   Saved: {len(combined)} rows")
     for m in sorted(combined["model"].unique()):
         sub = combined[(combined["model"] == m) & ((combined["lead_time_hours"] - 3.0).abs() < 0.25)]
         rmse = np.sqrt((sub["error"] ** 2).mean()) if len(sub) > 0 else 0
         print(f"     {m}: RMSE@3h={rmse:.3f} (N={len(sub)})")
 
-    # 8. Regenerate plots
-    print("\n8. Regenerating figures...")
-    os.system(f"/sdf/group/rubin/sw/conda/envs/lsst-scipipe-13.0.0/bin/python src/plot.py")
     print("\nDone!")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mb", action="store_true",
+                        help="Process the MeteoBlue-augmented run (paper_results_diff_mb.csv)")
+    args = parser.parse_args()
+    main(use_mb=args.mb)

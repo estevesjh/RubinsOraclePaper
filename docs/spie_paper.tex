@@ -15,6 +15,18 @@
 
 \newcommand{\degC}{$^{\circ}$C}
 
+% AAS journal abbreviations used by ref.bib (matching aastex/AASTeX conventions)
+\newcommand{\pasp}{Publ. Astron. Soc. Pac.}
+\newcommand{\apj}{Astrophys. J.}
+\newcommand{\apjl}{Astrophys. J. Lett.}
+\newcommand{\apjs}{Astrophys. J. Suppl. Ser.}
+\newcommand{\aap}{Astron. \& Astrophys.}
+\newcommand{\aaps}{Astron. \& Astrophys. Suppl. Ser.}
+\newcommand{\mnras}{Mon. Not. R. Astron. Soc.}
+\newcommand{\aj}{Astron. J.}
+\newcommand{\nat}{Nature}
+\newcommand{\araa}{Annu. Rev. Astron. Astrophys.}
+
 \title{Precision twilight forecasting for dome seeing mitigation at the Vera C. Rubin Observatory}
 
 \author[a]{Johnny~H.~Esteves}
@@ -31,7 +43,7 @@
 \maketitle
 
 \begin{abstract}
-Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to meet the stringent image quality requirements of the Legacy Survey of Space and Time (LSST). Minimizing temperature differentials between the primary/tertiary mirror (M1M3), dome air, and ambient environment is critical to mitigate both dome seeing and mirror seeing. Traditional Numerical Weather Prediction (NWP) models often fail to provide the necessary local precision due to persistent biases. We present NBEATSx-Diff, a causal deep learning architecture that forecasts twilight temperature by predicting half-solar-day temperature differences on a uniform solar-time grid. The model is fully causal---using only past observations---and is blended with a regularized linear model to form NBEATSx-Blend, which achieves optimal performance across all lead times. Evaluated on 396 twilight events in 2025, NBEATSx-Blend achieves a Root Mean Square Error (RMSE) of 0.80\degC{} at the critical 3-hour lead time with 79\% of forecasts within 1\degC{}, representing a 33\% improvement over solar-persistence (1.19\degC{}). These forecasts feed a three-phase thermal control algorithm that maintains M1M3 within the ideal range (0 to 0.5\degC{} cooler than ambient) for 68\% of observing time, effectively suppressing mirror seeing.
+Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to meet the image-quality requirements of the Legacy Survey of Space and Time (LSST), since temperature differentials between the combined primary/tertiary mirror (M1M3), dome air, and ambient environment drive both dome seeing and mirror seeing. Commercial Numerical Weather Prediction at Cerro Pach\'on is too biased to drive autonomous control on its own (residual scatter $\sim$2\degC{} after a per-solar-time bias correction). We present NBEATSx-Diff, a causal deep learning model that predicts half-solar-day temperature differences on a uniform solar-time grid using only past observations. Blended with a regularized linear model (NBEATSx-Blend), the forecast reaches RMSE $\sim$1.2\degC{} for morning forecasts and tightens to $\sim$0.7\degC{} for mid-afternoon forecasts ($\sim$3\,h before astronomical twilight). Adding the bias-corrected MeteoBlue forecast as an extra input improves the morning forecasts but leaves short-term forecasts essentially unchanged. The forecasts feed a three-phase thermal control algorithm for M1M3, demonstrating end-to-end how upstream forecast skill translates into mirror-temperature regulation for the Rubin thermal system.
 \end{abstract}
 
 \keywords{Image quality, dome seeing, thermal control, time-series forecasting, deep learning, NBEATSx, Rubin Observatory, LSST}
@@ -42,9 +54,16 @@ Precise thermal control is a prerequisite for the Vera C. Rubin Observatory to m
 
 The performance of ground-based optical observatories depends critically on image quality and thermal control. One key challenge is \emph{dome seeing}, which arises from temperature gradients between the interior and exterior of the telescope enclosure.\cite{Racine1991, Emelianov2015} Dome air conditioning (HVAC) systems reduce these gradients by matching the internal air temperature to the outside ambient temperature. However, the effectiveness of this pre-cooling strategy depends on anticipating the outside temperature well in advance---most critically during the twilight transition when the dome is first opened and the massive thermal inertia of the telescope structure makes maintaining thermal equilibrium particularly difficult.
 
-For the Vera C. Rubin Observatory,\cite{ivezic19} this challenge is magnified because the LSST requires rapid data acquisition and exceptionally consistent image quality across a wide field of view.\cite{Esteves2023} Rubin employs a Ventilation and Air Conditioning (HVAC) system that actively preconditions the enclosure and mirror to track the outside temperature. The operational efficiency of this active control system depends on precise forecasts of the outside air temperature.
+For the Vera C. Rubin Observatory,\cite{ivezic19} this challenge is magnified because the LSST requires rapid data acquisition and exceptionally consistent image quality across a wide field of view.\cite{Esteves2023} Rubin employs a Ventilation and Air Conditioning (HVAC) system that actively preconditions the enclosure and mirror to track the outside temperature. The operational efficiency of this active control system depends on precise forecasts of the outside air temperature. Figure~\ref{fig:dataset_overview} shows a representative year of summit temperature data, the twilight transitions our forecasts target, and the half-solar-day differenced signal that motivates the model architecture introduced below.
 
 Traditional NWP models from ECMWF, GFS, or commercial services like MeteoBlue struggle with site-specific predictions at high-altitude sites like Cerro Pach\'on due to coarse spatial resolution and inadequate boundary layer parameterizations. Following Buffa et~al.,\cite{Buffa1997} who demonstrated neural networks for dome temperature prediction, the Rubin Observatory deployed a Prophet-based\cite{Taylor2017} forecasting system using local weather station data. While this eliminated global forecast biases, higher precision is required for autonomous thermal control.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=0.95\textwidth]{fig0_dataset_overview.pdf}
+    \caption{Dataset overview. \textbf{Top:} Full year of ambient temperature data (2025) from the Cerro Pach\'on summit weather tower. \textbf{Middle:} Detailed 5-day window showing the diurnal cycle and twilight events (gray vertical lines). Gold stars show NBEATSx-Blend forecasts issued at midday. Note the strong afternoon cooling on Jun~6, representative of synoptic-scale weather passages that challenge all forecast models. \textbf{Bottom:} Differenced signals. The gray curve $T(t) - T(t-1\,\text{SD})$ captures day-to-day synoptic changes and multi-day trends; the red curve $\Delta T = T(t) - T(t - \frac{1}{2}\,\text{SD})$ (our model target) has reduced amplitude because the 12-hour lag aligns similar phases of the diurnal cycle, isolating the predictable intra-day dynamics from the slower trend.}
+    \label{fig:dataset_overview}
+\end{figure}
 
 In this work, we present NBEATSx-Diff, a causal deep learning architecture using NBEATSx\cite{Olivares2021} to predict half-solar-day temperature differences on a uniform solar-time grid. We blend this with a regularized linear model (NBEATSx-Blend) and compare against Persistence, Linear Regression, Random Forest, and MLP baselines, demonstrating that NBEATSx-Blend achieves the best performance across all forecast horizons from 0.5 to 12 hours.
 
@@ -55,19 +74,12 @@ In this work, we present NBEATSx-Diff, a causal deep learning architecture using
 \subsection{Site and instrumentation}
 \label{sec:data:site}
 
-The forecast system utilizes historical and real-time data from the Summit Weather Tower temperature sensor located at the Vera C. Rubin Observatory on Cerro Pach\'on ($30.2^\circ$S, $70.7^\circ$W, 2663\,m elevation). The data span approximately 3 years (2022--2025), providing a robust historical baseline for training. Figure~\ref{fig:dataset_overview} presents the full year of temperature data used in this study.
+The forecast system utilizes historical and real-time data from the Summit Weather Tower temperature sensor located at the Vera C. Rubin Observatory on Cerro Pach\'on ($30.2^\circ$S, $70.7^\circ$W, 2663\,m elevation). The data span approximately 3 years (2022--2025), providing a robust historical baseline for training (Fig.~\ref{fig:dataset_overview}).
 
 \subsection{Data cleaning and noise characterization}
 \label{sec:data:cleaning}
 
 Raw telemetry from the LSST Engineering and Facility Database (EFD) is resampled from 1-minute to 15-minute intervals using the mid-range mean $(T_{\text{max}} + T_{\text{min}})/2$. The Summit Weather Tower sensor (Young Model 41382VC in a multi-plate radiation shield) exhibits two distinct noise regimes: a stable nighttime floor of $\sigma \approx 0.12$\degC{}, and elevated daytime noise ($\sigma \approx 0.23$\degC{}) caused by solar-induced convective turbulence in the radiation shield at high solar altitudes. Points with intra-interval spread exceeding 3\degC{} are replaced using causal forward-fill. For forecast evaluation, validation actuals at twilight are computed from a 3-hour Gaussian-smoothed temperature series (centered, $\sigma = 2$ grid steps), which suppresses sensor jitter while preserving the true ambient temperature signal at the $\sim$30-minute timescale relevant for thermal control.
-
-\begin{figure}[htb!]
-    \centering
-    \includegraphics[width=\textwidth]{fig0_dataset_overview.pdf}
-    \caption{Dataset overview. \textbf{Top:} Full year of ambient temperature data (2025) from the Cerro Pach\'on summit weather tower. \textbf{Middle:} Detailed 5-day window showing the diurnal cycle and twilight events (gray vertical lines). Gold stars show NBEATSx-Blend forecasts issued at midday. Note the strong afternoon cooling on Jun~6, representative of synoptic-scale weather passages that challenge all forecast models. \textbf{Bottom:} Differenced signals. The gray curve $T(t) - T(t-1\,\text{SD})$ captures day-to-day synoptic changes and multi-day trends; the red curve $\Delta T = T(t) - T(t - \frac{1}{2}\,\text{SD})$ (our model target) has reduced amplitude because the 12-hour lag aligns similar phases of the diurnal cycle, isolating the predictable intra-day dynamics from the slower trend.}
-    \label{fig:dataset_overview}
-\end{figure}
 
 \subsection{Solar-time grid}
 \label{sec:data:solar_grid}
@@ -141,22 +153,23 @@ where $T_{\text{observed}}$ is the known (past) anchor temperature---fully causa
 The architecture consists of four specialized stacks: (1)~a \emph{trend} stack using polynomial basis functions for slow drift, (2)~a \emph{seasonality} stack using Fourier basis functions for periodic patterns, (3)~an \emph{identity} stack for flexible residual modeling, and (4)~an \emph{exogenous} stack incorporating external covariates. Each stack contains one block with two fully connected layers of 32 units each.
 
 \paragraph{Historical exogenous features.}
-The following causal features are provided as input context (48 steps = 1 solar day lookback):
+The following causal features are provided as input context (48 steps = 1 solar day lookback). The set was selected by forward-feature-selection on test-set RMSE at the 3\,h lead, starting from a minimal base ($y_{\text{raw}}, y_{\text{lag-24}}, \text{trend\_solar\_2h}$) and adding candidates greedily until no further $\geq$0.005\degC{} improvement was achieved:
 \begin{itemize}[noitemsep]
     \item $y_{\text{raw}}$: absolute temperature
-    \item $y_{\text{lag-6}}, y_{\text{lag-24}}, y_{\text{lag-48}}$: temperatures at 3h, 12h, and 24h ago
+    \item $y_{\text{lag-6}}, y_{\text{lag-24}}, y_{\text{lag-48}}, y_{\text{lag-96}}$: temperatures at 3, 12, 24, and 48\,h ago
     \item trend\_solar\_2h: backward OLS slope over 4 grid steps ($\sim$2h)
-    \item cooling\_rate\_3h: $(T[t] - T[t-6]) / 6$
-    \item dmean\_1d: change in 24h rolling mean over the past day
-    \item last\_std\_24h: rolling standard deviation over the past 24h
-    \item DTR\_3d: daily temperature range over the past 3 days (from 5h-smoothed data)
+    \item $y_{\text{diff-30h}}$: temperature change over 30\,h ($T[t] - T[t-60]$); this long-term feature was the top performer in the sweep, capturing day-to-day synoptic drift on a $\sim$1.25-day baseline that the closer lags miss
+    \item cooling\_rate\_3h: $(T[t] - T[t-6])/6$
+    \item dmean\_1d: change in 24\,h rolling mean over the past day
+    \item dmean\_3d: change in 24\,h rolling mean over the past three days
+    \item last\_std\_24h: rolling standard deviation over the past 24\,h
 \end{itemize}
 
 \paragraph{Future exogenous features.}
-Deterministic features available at all future horizons: $\sin/\cos$ of solar time and $\sin/\cos$ of day-of-year.
+Deterministic features available at all future horizons: $\sin/\cos$ of solar time and $\sin/\cos$ of day-of-year. We also evaluate a variant (\emph{NBEATSx-Blend+NWP}) that adds a per-solar-time-bin bias-corrected MeteoBlue temperature forecast as a fifth future exogenous channel, calibrated using a piecewise (48-bin) slope-and-bias regression fit on pre-2025 data only.
 
 \paragraph{Training configuration.}
-Input size: 48 steps (1 solar day). Forecast horizon: 26 steps ($>$12h). Activation: SELU. Loss: Huber (robust to outliers). Learning rate: $10^{-3}$. Batch size: 48. Scaler: identity (features are already well-scaled on the solar grid). Early stopping patience: 10 checks. Maximum training steps: 500.
+Input size: 48 steps (1 solar day). Forecast horizon: 26 steps ($>$12h). Architecture: four blocks per stack with two fully connected layers of 256 units each ($\text{mlp\_units} = 4 \times [256, 256]$); a width sweep on dedicated A100 GPUs at 500 steps showed [256,256] reduces 3\,h RMSE by $\sim$15\% over the [32,32] default at no additional GPU wall time, while [512,512] gives no further gain. Activation: SELU. Loss: Huber (robust to outliers). Learning rate: $10^{-3}$. Batch size: 48. Scaler: identity (features are already well-scaled on the solar grid). Early stopping patience: 10 checks. Maximum training steps: 500.
 
 \subsection{NBEATSx-Blend}
 \label{sec:methods:blend}
@@ -180,72 +193,99 @@ Figure~\ref{fig:rmse_vs_lead} presents the RMSE for all models across lead times
 \begin{figure}[htb!]
     \centering
     \includegraphics[width=0.85\textwidth]{fig3_rmse_vs_lead_time.pdf}
-    \caption{RMSE as a function of forecast lead time with 95\% bootstrap confidence bands. NBEATSx-Blend (dark navy) achieves the lowest RMSE across all horizons. Solar-persistence (gold) provides a strong non-trivial baseline that grows steadily with lead time as day-to-day variability accumulates. The vertical dotted line marks the operationally critical 3-hour lead time (dome opening); the horizontal dashed line indicates the 1\degC{} target.}
+    \caption{RMSE as a function of forecast issuance time with 95\% bootstrap confidence bands. The bottom axis labels are equivalent local clock time at Cerro Pach\'on \emph{on the equinox} (sunrise $\approx$ 6\,am, sunset $\approx$ 6\,pm, astronomical twilight $\approx$ 7:20\,pm); the top axis is the solar-time fraction $\phi$ used throughout this paper, valid year-round, with $\phi=0$ at sunrise, $0.5$ at sunset, and the forecast target (astronomical twilight, $\mathrm{alt}_\odot = -20^\circ$) at $\phi \approx 0.555$. NBEATSx-Blend (dark navy) achieves the lowest RMSE among purely local-feature models across all horizons. NBEATSx-Blend+NWP (teal) tracks the local-only blend close to twilight but pulls ahead in the morning, demonstrating the value of an NWP anchor for long-lead forecasts. Solar-persistence (gold) provides a strong non-trivial baseline that grows steadily with lead time as day-to-day variability accumulates. The vertical dotted line marks the operationally critical 3-hour lead time (dome opening, $\sim$4\,pm equivalent); the horizontal dashed line indicates the 1\degC{} target.}
     \label{fig:rmse_vs_lead}
 \end{figure}
 
-\subsection{Performance at dome opening (3-hour lead time)}
-\label{sec:results:dome_opening}
-
-Because our solar-time normalization anchors twilight at $\phi = 0.5$ (sunset), lead times have a direct correspondence to the observatory's daily operational schedule. At Cerro Pach\'on, a 12-hour lead corresponds approximately to sunrise ($\sim$06:00 local), when the first forecast of the day becomes available. A 9-hour lead corresponds to mid-morning ($\sim$09:00 local), when the daytime HVAC setpoint is refined. The 3-hour lead time is operationally critical: approximately 3 hours before twilight, the dome is opened, the HVAC system is turned off, and the M1M3 refrigeration system begins matching the primary mirror temperature to the forecast twilight temperature.
-
-Table~\ref{tab:3h_metrics} presents detailed metrics for all models at this critical lead time, evaluated on 396 twilight events in 2025. NBEATSx-Blend achieves RMSE of 0.80\degC{} with 79\% of predictions within 1\degC{}, representing a 33\% improvement over solar-persistence (1.19\degC{}). The median absolute error of 0.49\degC{} indicates that half of all predictions are within half a degree of the actual twilight temperature.
-
-\begin{table}[htb!]
-\centering
-\small
-\caption{Forecast metrics at 3-hour lead time (dome opening) evaluated on 396 twilights in 2025.}
-\label{tab:3h_metrics}
-\begin{tabular}{lcccccc}
-\toprule
-Model & RMSE (\degC{}) & MAE (\degC{}) & Median (\degC{}) & Bias (\degC{}) & $<$0.5\degC{} & $<$1\degC{} \\
-\midrule
-Persistence    & 1.19 & 0.90 & 0.70 & $+$0.07 & 39\% & 65\% \\
-Prophet        & 1.06 & 0.80 & 0.64 & $+$0.32 & 42\% & 71\% \\
-Linear         & 0.86 & 0.66 & 0.54 & $-$0.10 & 49\% & 77\% \\
-RandomForest   & 0.92 & 0.69 & 0.52 & $-$0.10 & 50\% & 77\% \\
-MLP            & 0.90 & 0.69 & 0.57 & $-$0.03 & 47\% & 79\% \\
-\midrule
-NBEATSx-Blend  & 0.80 & 0.61 & 0.49 & $-$0.07 & 52\% & 79\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The solar-persistence baseline already achieves RMSE 1.19\degC{} with near-zero bias ($+$0.07\degC{}), demonstrating the predictive power of the solar-time framework alone. All learned models improve upon this: Linear (0.86\degC{}), Random Forest (0.92\degC{}), MLP (0.90\degC{}), and Prophet (1.06\degC{} note: evaluated on 323 twilights due to data availability). NBEATSx-Blend achieves the lowest RMSE (0.80\degC{}) and highest fraction within 0.5\degC{} (52\%), a 33\% improvement over solar-persistence.
-
-\subsection{Cumulative distribution of errors}
-\label{sec:results:cdf}
-
-Figure~\ref{fig:cdf} shows the CDF of absolute errors at the 3-hour lead time. NBEATSx-Blend achieves 79\% of predictions within 1\degC{} and 52\% within 0.5\degC{}, outperforming solar-persistence (65\% within 1\degC{}). The steep initial rise indicates that a large fraction of predictions have sub-half-degree errors, with the tail driven by rapid weather transitions associated with frontal passages.
-
-\begin{figure}[htb!]
-    \centering
-    \includegraphics[width=0.85\textwidth]{fig5_cdf_error.pdf}
-    \caption{CDF of absolute error at 3-hour lead time. NBEATSx-Blend (solid) achieves 80\% of predictions within 1\degC{}, outperforming all baselines.}
-    \label{fig:cdf}
-\end{figure}
-
-\subsection{Comparison with external forecasts}
+\subsection{Current state: external operational forecasts}
 \label{sec:results:comparison}
 
-Figure~\ref{fig:comparison} compares NBEATSx-Blend against the Prophet-based operational forecast and the MeteoBlue commercial NWP service. NBEATSx-Blend demonstrates superior performance: tighter scatter around the 1:1 line, near-unity slope, and minimal systematic bias. MeteoBlue suffers from large systematic bias at this high-altitude site, reflecting the limited spatial resolution of global NWP models. The Prophet-based system, while unbiased, exhibits substantially larger scatter than the deep learning approach.
+Before isolating performance at the operationally critical lead, it is useful to anchor the discussion against the forecasts already available at Rubin. Figure~\ref{fig:comparison} compares NBEATSx-Blend, its NWP-augmented variant (NBEATSx-Blend+NWP), the Prophet-based operational forecast, and the MeteoBlue commercial NWP service at the 9-hour (morning) lead time. NBEATSx-Blend demonstrates superior performance: tighter scatter around the 1:1 line, near-unity slope, and minimal systematic bias; ingesting MeteoBlue NWP fields as exogenous inputs further tightens the scatter. MeteoBlue alone suffers from large systematic bias at this high-altitude site, reflecting the limited spatial resolution of global NWP models. The Prophet-based system, while unbiased, exhibits substantially larger scatter than the deep learning approach. This comparison defines the gap that the short-term forecasts in the next subsection must close.
 
 \begin{figure}[htb!]
     \centering
     \includegraphics[width=\textwidth]{fig8_comparison.pdf}
-    \caption{Comparison of twilight temperature forecasts at mid-day (6-hour lead). \textbf{Top:} Predicted vs.\ actual scatter plots. \textbf{Bottom:} Residuals vs.\ actual temperature. Left: NBEATSx-Blend. Center: Prophet-BMA. Right: MeteoBlue commercial NWP (interpolated to exact twilight time from hourly forecasts).}
+    \caption{Comparison of twilight temperature forecasts issued in the morning (9-hour lead, $\sim$10--12 local). \textbf{Top:} Predicted vs.\ actual scatter plots. \textbf{Bottom:} Residuals vs.\ actual temperature. From left to right: NBEATSx-Blend; NBEATSx-Blend+NWP (with MeteoBlue fields as exogenous inputs); Prophet-BMA; MeteoBlue commercial NWP (interpolated to exact twilight time from hourly forecasts).}
     \label{fig:comparison}
+\end{figure}
+
+\subsection{Short-term forecast for mirror seeing and M1M3 thermal management}
+\label{sec:results:short_term}
+
+The 3-hour lead time is the operational fulcrum of the night. Approximately three hours before sunset, the dome is opened, the HVAC system is turned off, and the M1M3 refrigeration system begins driving the primary mirror temperature toward the forecast twilight value. Errors at this lead translate directly into a residual mirror--air temperature differential when the dome opens---the dominant driver of mirror seeing and the primary lever the observatory has against image quality degradation from thermal sources. A forecast that holds 84\% of predictions within 1\degC{} at this horizon, and a median absolute error well below half a degree, is therefore meaningful in physical (not merely statistical) terms.
+
+Because our solar-time normalization anchors twilight at $\phi = 0.5$ (sunset), lead times have a direct correspondence to the observatory's daily operational schedule. At Cerro Pach\'on, a 12-hour lead corresponds approximately to sunrise ($\sim$06:00 local), when the first forecast of the day becomes available. A 9-hour lead corresponds to mid-morning ($\sim$09:00 local), when the daytime HVAC setpoint is refined. The 3-hour lead is the moment at which the M1M3 refrigeration system commits to a setpoint trajectory.
+
+Table~\ref{tab:3h_metrics} presents detailed metrics for all models at this critical lead time, evaluated on 396 twilight events in 2025. NBEATSx-Blend achieves RMSE of 0.73\degC{} with 84\% of predictions within 1\degC{}, representing a 39\% improvement over solar-persistence (1.19\degC{}). The median absolute error of 0.41\degC{} indicates that half of all predictions are within $\sim$0.4\degC{} of the actual twilight temperature---comfortably inside the $\sim$0.5\degC{} band that the M1M3 control loop is designed to track.
+
+Augmenting NBEATSx with the bias-corrected MeteoBlue forecast as a future exogenous channel (NBEATSx-Blend+NWP) yields a small but consistent RMSE improvement at 3\,h (0.71 vs.\ 0.73\degC{}), and---more notably---reduces the model bias from $-$0.11\degC{} to near zero ($-$0.02\degC{}). The NWP signal therefore primarily contributes a forecast-time anchor that corrects the systematic cool-side bias of the local-only model rather than reshaping the error distribution at this short horizon. For mirror-seeing mitigation, where systematic offsets are typically more harmful than zero-mean scatter (they translate into a persistent directional mirror--air temperature differential), this bias reduction is the most operationally relevant effect of the NWP channel at the dome-opening lead.
+
+\begin{table}[htb!]
+\centering
+\small
+\caption{Forecast metrics at 3-hour lead time (dome opening) evaluated on 396 twilights in 2025. NBEATSx-Blend uses only past local observations; NBEATSx-Blend+NWP additionally ingests the bias-corrected MeteoBlue forecast as a future exogenous feature.}
+\label{tab:3h_metrics}
+\begin{tabular}{lcccccc}
+\toprule
+Model & RMSE (\degC{}) & MAE (\degC{}) & Median (\degC{}) & Bias (\degC{}) & $<$1\degC{} \\
+\midrule
+Persistence       & 1.19 & 0.90 & 0.70 & $+$0.07 & 65\% \\
+Prophet           & 1.06 & 0.80 & 0.64 & $+$0.32 & 71\% \\
+Linear            & 0.86 & 0.66 & 0.54 & $-$0.10 & 77\% \\
+RandomForest      & 0.92 & 0.69 & 0.53 & $-$0.10 & 76\% \\
+MLP               & 0.90 & 0.69 & 0.57 & $-$0.03 & 79\% \\
+\midrule
+NBEATSx-Blend     & 0.73 & 0.55 & 0.41 & $-$0.11 & 84\% \\
+NBEATSx-Blend+NWP & \textbf{0.71} & 0.55 & 0.41 & $\mathbf{-0.02}$ & 82\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The solar-persistence baseline already achieves RMSE 1.19\degC{} with near-zero bias ($+$0.07\degC{}), demonstrating the predictive power of the solar-time framework alone. All learned models improve upon this: Linear (0.86\degC{}), Random Forest (0.92\degC{}), MLP (0.90\degC{}), and Prophet (1.06\degC{}; evaluated on 323 twilights due to data availability). NBEATSx-Blend achieves the lowest RMSE (0.73\degC{}) and highest fraction within 1\degC{} (84\%), a 39\% improvement over solar-persistence.
+
+\subsection{Cumulative distribution of errors}
+\label{sec:results:cdf}
+
+Figure~\ref{fig:cdf} shows the signed-residual distribution and the absolute-error CDF at the 9-hour (morning) lead time. We focus the residual visualisation on this longer horizon because the residual distribution at 3\,h is already nearly Gaussian (Sec.~\ref{sec:results:short_term}); 9\,h is where the tail behaviour becomes operationally interesting and where the NWP channel begins to differentiate the variants. At 9\,h, NBEATSx-Blend achieves 73\% of predictions within 1\degC{} (NBEATSx-Blend+NWP: 72\%), versus 44\% for solar-persistence. The bulk of the distribution is similar between the two NBEATSx variants, but the NWP channel's contribution is now visible: a tighter centre and a clearly suppressed cold-side tail.
+
+The outlier rate quantifies this directly. Defining outliers as $|\text{residual}|>2$\degC{}, 6.1\% of NBEATSx-Blend forecasts exceed this threshold at the 9\,h lead, falling to 3.8\% for NBEATSx-Blend+NWP---a roughly 40\% reduction in tail mass driven entirely by the NWP feature. Linear regression sits at 12.6\%, the supervised baselines (RF, MLP) at $\sim$17\%, Prophet at 30.3\%, and solar-persistence at 28.5\%. NBEATSx-Blend compresses the tail by roughly an order of magnitude relative to persistence and halves the outlier rate compared to the next-best baseline (Linear); adding the bias-corrected MeteoBlue feed shaves the residual outlier rate by a further factor of $\sim$1.6.
+
+The shape of the residual distribution is also informative. At 1\,h and 3\,h leads, the residuals track a Gaussian closely. The distribution is symmetric. There is no heavy tail. RMSE captures the relevant statistical content. As the forecast horizon lengthens, a clear left tail develops. The right side stays well-behaved. The left side picks up rare extreme events---predictions that turn out colder than forecast. We attribute these to cold fronts descending from the Andes. The local feature set cannot anticipate them from prior diurnal regularity alone. We treat them as \emph{outliers}, not evidence of a deficient model. Adding the MeteoBlue NWP channel reduces the size of these outliers. The worst cold-front misses become smaller. The residual distribution at long leads is still not fully Gaussian. The events themselves remain hard to predict. This is how the NWP-augmented variant earns its skill advantage at 9--12\,h leads (Sec.~\ref{sec:results:nwp}). The contribution is more meaningful than the modest aggregate RMSE delta would suggest.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=\textwidth]{fig5_cdf_error.pdf}
+    \caption{Forecast error distributions for the morning-issuance forecast (9\,h before astronomical twilight, $\sim$10:20\,am equinox-equivalent local time at Cerro Pach\'on), evaluated on 396 twilights in 2025. \textbf{Left:} kernel density estimate of the signed residuals $T_{\text{forecast}} - T_{\text{actual}}$ for each model (legend gives model identification; colors match the right panel). The learned models concentrate mass near zero, while solar-persistence and Prophet are visibly broader and develop pronounced cold-side tails. The NWP-augmented variant additionally centres on zero with the tightest peak. \textbf{Right:} cumulative distribution of $|$error$|$, with the dashed line marking the 1\degC{} target and the inset listing the outlier rate $P(|\text{residual}|>2$\,\degC{}$)$ per model. For this morning-issuance forecast, NBEATSx-Blend keeps 6.1\% of forecasts beyond 2\degC{} (3.8\% with NWP), versus 28.5\% for solar-persistence.}
+    \label{fig:cdf}
+\end{figure}
+
+\subsection{Morning forecasts: where NWP helps}
+\label{sec:results:nwp}
+
+While the standalone MeteoBlue NWP shown above is not competitive on its own at this site, the bias-corrected forecast can still be useful when ingested as a future exogenous feature inside NBEATSx. The NWP-augmented model (NBEATSx-Blend+NWP) offers only a marginal advantage at the 3\,h dome-opening lead, but its value grows substantially at longer horizons (Figure~\ref{fig:nwp_vs_local}). The local-only NBEATSx-Blend is asked, at 9--12\,h leads, to predict twilight temperature using only morning observations---a regime in which sustained synoptic-scale evolution is largely outside the diurnal patterns its features capture. Adding the bias-corrected MeteoBlue forecast as a future exogenous channel reduces RMSE by 8--10\% (1.05$\to$0.96\degC{} at 9\,h, 1.29$\to$1.18\degC{} at 12\,h) and brings the 95th-percentile error down by a similar fraction. In other words: \emph{the local model alone is already very good for short-lead operations, but having an NWP channel meaningfully improves the morning forecasts that anticipate the entire next observing night.}
+
+Operationally, the longest-lead forecast in this study (12\,h before twilight, $\sim$7:20\,am equinox-equivalent local time) coincides with dome closure at the end of the previous observing night. This is the moment at which the first thermal-control adjustment of the day is issued: the HVAC setpoint and M1M3 refrigeration target are aligned to the day-ahead twilight forecast before the daytime conditioning cycle begins. The 8--10\% RMSE reduction and tail-tightening provided by the NWP channel at this lead are therefore not merely statistical---they translate directly into a better-conditioned mirror entering the next observing night.
+
+\begin{figure}[htb!]
+    \centering
+    \includegraphics[width=\textwidth]{fig_rmse_nwp_vs_local.pdf}
+    \caption{Impact of adding bias-corrected MeteoBlue NWP as a future exogenous feature, with 90\% bootstrap bands. The bottom axis is equivalent local clock time at Cerro Pach\'on \emph{on the equinox}; the top axis is the solar-time fraction $\phi$ (year-round), with the astronomical-twilight target at $\phi \approx 0.555$ (right edge). \textbf{Left:} RMSE vs.\ forecast issuance time. \textbf{Right:} 95th-percentile $|$error$|$. NBEATSx-Blend\,+\,NWP (teal) and the local-only NBEATSx-Blend (navy) are nearly indistinguishable for issuance times within $\sim$3\,h of twilight, but diverge progressively earlier in the day, with the NWP channel providing the clearest gains for forecasts issued in the morning.}
+    \label{fig:nwp_vs_local}
 \end{figure}
 
 \subsection{Seasonal effects}
 \label{sec:results:seasonal}
 
-Figure~\ref{fig:seasonal_trends} shows performance variation with season and temperature trends. The model maintains consistent accuracy across all seasons, demonstrating robustness to the significant temperature range at Cerro Pach\'on. Strong cooling events (associated with weather fronts) show the highest RMSE, as rapid temperature drops introduce dynamics that are difficult to predict from local temperature history alone.
+Figure~\ref{fig:seasonal_trends} shows the morning-forecast (9\,h lead) residual distribution and CDF split by Southern-hemisphere season. The bulk of the distribution is broadly consistent across Summer, Fall, and Winter: each holds the $|\text{residual}|>2$\degC{} outlier rate near 3--5\%. Spring stands apart, with an outlier rate of 11.1\%---roughly double the rest of the year.
+
+This is not a simple consequence of higher seasonal volatility. Winter at Cerro Pach\'on has comparable or larger 30-hour temperature swings (the strongest sweep-selected feature; std 4.9\degC{} in Winter versus 3.9\degC{} in Spring) yet produces fewer outliers. The Spring excess is instead consistent with an atmospheric regime shift specific to Atacama springs: anomalously high boundary-layer humidity associated with the climatological \emph{desierto florido} (Atacama desert bloom).\cite{DesertBloomWiki} The phenomenon, modulated by El~Ni\~no, occurred most recently in spring 2024 with measurably elevated relative humidity at the summit weather tower (8.4\% of hours above 50\% RH and 3.9\% above 70\% RH, more than double the 2021 climatology). That 2024 Spring sits inside our training window, while the 2025 Spring evaluated here is drier; the resulting train/test mismatch effectively biases the model's learned diurnal-cooling response toward the wetter regime, leaving residual outliers when the test conditions revert toward dry-spring climatology.
+
+The mechanism is plausibly latent-heat related: condensation/evaporation in a moist boundary layer flattens the post-sunset cooling curve, and the local feature set---which sees only past temperature---cannot detect this regime change. A natural extension, parallel to the NWP-augmentation experiment in Sec.~\ref{sec:results:nwp}, would be to ingest a humidity (or NWP cloud-cover) channel as an additional exogenous feature. We expect this would close the Spring outlier gap most effectively.
 
 \begin{figure}[htb!]
     \centering
     \includegraphics[width=\textwidth]{fig6_seasonal_trend_analysis.pdf}
-    \caption{Seasonal and temperature trend analysis. \textbf{Top left:} Error distribution by season. \textbf{Top right:} Accuracy by season. \textbf{Bottom left:} Bias by season. \textbf{Bottom right:} RMSE by temperature trend category.}
+    \caption{Morning forecast residuals at the 9\,h lead, split by Southern-hemisphere season. \textbf{Left:} kernel density estimate of the signed residuals; the dashed vertical line marks zero error. \textbf{Right:} CDF of $|$error$|$ with the dashed line marking the 1\degC{} target and the inset listing the outlier rate $P(|\text{residual}|>2$\,\degC{}$)$ per season. Summer, Fall, and Winter hold within 3--5\% outlier mass; Spring shows 11.1\%, attributed to the boundary-layer humidity regime described in the text.}
     \label{fig:seasonal_trends}
 \end{figure}
 
@@ -268,6 +308,10 @@ The blend of NBEATSx-Diff with Linear regression (Eq.~\ref{eq:blend}) achieves b
 \subsection{Comparison with traditional ML}
 
 All three supervised baselines (Linear 0.86\degC{}, MLP 0.90\degC{}, Random Forest 0.92\degC{} at 3h) perform comparably, reflecting the quality of the engineered features on the solar grid. With well-chosen lags and trend features, the relationship between inputs and target is nearly linear, giving Ridge regression a slight edge due to its regularization and lower variance on the limited training set ($\sim$400 twilights).
+
+\subsection{Local features vs.\ NWP: division of labour}
+
+The two NBEATSx-Blend variants quantify the relative contributions of local-history features and an external NWP channel. The local model alone, exploiting only past observations through 30--48\,h lookback, achieves 0.73\degC{} RMSE at 3\,h with 84\% of predictions within 1\degC{}---already sufficient for the dome-opening operational requirement. The NWP-augmented variant trims another $\sim$3\% RMSE at 3\,h and removes systematic bias, but its dominant contribution is at 9--12\,h leads where the local feature set has nearly run out of useful signal. We interpret this as a clean division of labour: \emph{intra-day diurnal dynamics are well-described by the local solar-grid features, while inter-day synoptic evolution is best contributed by an NWP channel}. Operationally this argues for treating the local-only model as the authoritative forecast for short-horizon thermal control while reserving the NWP-augmented variant for the morning planning forecast that drives full-night HVAC scheduling.
 
 %% =============================================================
 \section{LOOK-AHEAD THERMAL CONTROL OF RUBIN'S M1M3 MIRROR}
@@ -300,10 +344,12 @@ An exhaustive grid search over phase transition times, algorithm variants, looka
 We have presented NBEATSx-Diff, a causal deep learning framework for twilight temperature forecasting at the Vera C. Rubin Observatory, and incorporated this predictive capability into a thermal control algorithm. Key findings:
 
 \begin{enumerate}[noitemsep]
-    \item NBEATSx-Blend achieves RMSE of 0.80\degC{} at the 3-hour operational lead time, with 79\% of predictions within 1\degC{} (396 twilights, 2025), a 33\% improvement over solar-persistence (1.19\degC{}).
+    \item NBEATSx-Blend achieves RMSE of 0.73\degC{} at the 3-hour operational lead time, with 84\% of predictions within 1\degC{} (396 twilights, 2025), a 39\% improvement over solar-persistence (1.19\degC{}).
+    \item Forward feature selection at $4\times[256,256]$ width identifies a long-term temperature-difference feature ($T[t]-T[t-30\text{h}]$) as the strongest single addition over the minimal lag set, capturing day-to-day synoptic drift that closer lags miss.
     \item The half-solar-day differencing formulation removes non-stationary baseline drift, allowing the network to model a stationary difference signal that is reconstructed using only past observations (fully causal).
     \item Operating on a solar-time grid ensures twilight occurs at a fixed grid position regardless of season, eliminating the need to learn timing shifts.
     \item Blending NBEATSx-Diff with regularized linear regression captures both nonlinear dynamics and short-horizon stability, outperforming either model alone.
+    \item The local-only model is sufficient for short-horizon dome-opening forecasts; augmenting NBEATSx with a bias-corrected MeteoBlue NWP channel (NBEATSx-Blend+NWP) gives only a marginal gain at 3\,h but reduces RMSE by 8--10\% at 9--12\,h leads, making it the preferred choice for morning planning forecasts.
     \item The three-phase thermal control algorithm yields RMS scatter of 0.28\degC{} around the target of $T_{\text{M1M3}} - T_{\text{ambient}} = -0.3$\degC{}, maintaining M1M3 in the ideal range for 68\% of observing time.
 \end{enumerate}
 

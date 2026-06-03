@@ -11,6 +11,7 @@ Usage:
 
 import os
 import sys
+import time
 import warnings
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -24,7 +25,8 @@ logging.getLogger("lightning").setLevel(logging.CRITICAL)
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "data", "rubin-twilight-forecast"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (
@@ -78,6 +80,13 @@ def compute_all_features(grid):
     grid["y_diff_48h"] = y_arr - np.roll(y_arr, 96)
     grid.iloc[:48, grid.columns.get_loc("y_diff_24h")] = np.nan
     grid.iloc[:96, grid.columns.get_loc("y_diff_48h")] = np.nan
+
+    # ── Long-term trend differences (from correlation analysis: lag 60 = 30h
+    #    showed strongest |r| with residual error, especially for Spring) ──
+    for lag_steps, name in [(60, "y_diff_30h"), (78, "y_diff_39h"),
+                            (90, "y_diff_45h")]:
+        grid[name] = y_arr - np.roll(y_arr, lag_steps)
+        grid.iloc[:lag_steps, grid.columns.get_loc(name)] = np.nan
 
     # ── Solar-time anchor lags ──
     # For each row, get T at specific solar times of the CURRENT or PREVIOUS day
@@ -141,6 +150,8 @@ ALL_CANDIDATES = [
     "trend_solar_4h", "cooling_rate_3h",
     # Diurnal diffs
     "y_diff_24h", "y_diff_48h",
+    # Long-term trend (Spring residual correlations)
+    "y_diff_30h", "y_diff_39h", "y_diff_45h",
     # Solar anchors
     "y_sunrise", "y_midday", "y_midafternoon", "y_sunset", "y_midnight",
     # DTR variants
@@ -169,6 +180,8 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
     nf_train["unique_id"] = "temp"
     val_size = int(len(nf_train) * 0.1)
 
+    accel = os.environ.get("FS_ACCEL", "gpu")
+    width = [int(x) for x in os.environ.get("FS_WIDTH", "32,32").split(",")]
     model = NBEATSx(
         h=NBEATS_HORIZON, input_size=NBEATS_INPUT_SIZE, max_steps=max_steps,
         hist_exog_list=hist_exog, futr_exog_list=futr_exog,
@@ -176,8 +189,9 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
         batch_size=48, scaler_type="identity", enable_progress_bar=False,
         enable_model_summary=False,
         stack_types=["trend", "seasonality", "identity", "exogenous"],
-        mlp_units=4 * [[32, 32]], n_blocks=[1, 1, 1, 1],
+        mlp_units=4 * [width], n_blocks=[1, 1, 1, 1],
         early_stop_patience_steps=5, val_check_steps=20,
+        accelerator=accel, devices=1,
     )
 
     with suppress_stdout():
@@ -214,7 +228,7 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
         batch_meta.append((uid, target_idx, issue_idx, ev["y_actual"]))
 
     if len(all_hist) < 30:
-        return np.nan
+        return {"rmse": np.nan, "pct_1c": np.nan, "n": len(all_hist)}
 
     # Single batched predict call
     combined_hist = pd.concat(all_hist, ignore_index=True)
@@ -243,16 +257,21 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
         errors.append(y_actual - T_pred)
 
     if len(errors) < 30:
-        return np.nan
-    return np.sqrt(np.mean(np.array(errors) ** 2))
+        return {"rmse": np.nan, "pct_1c": np.nan, "n": len(errors)}
+    abs_err = np.abs(np.array(errors))
+    return {
+        "rmse": float(np.sqrt(np.mean(abs_err ** 2))),
+        "pct_1c": float((abs_err < 1.0).mean()),
+        "n": int(len(errors)),
+    }
 
 
 def evaluate_feature_wrapper(args):
     """Wrapper for parallel execution."""
     grid, tw_test, base_feats, new_feat, max_steps = args
     test_set = base_feats + [new_feat]
-    rmse = evaluate_feature_set(grid, tw_test, test_set, max_steps=max_steps)
-    return new_feat, rmse
+    metrics = evaluate_feature_set(grid, tw_test, test_set, max_steps=max_steps)
+    return new_feat, metrics
 
 
 def main():
@@ -321,56 +340,75 @@ def main():
     print("PHASE 2: Forward selection (max_steps=100, parallel)")
     print("=" * 70)
 
-    MAX_STEPS = 50
+    MAX_STEPS = int(os.environ.get("FS_MAX_STEPS", 50))
+    max_feats = os.environ.get("FS_MAX_FEATS")
+    if max_feats is not None:
+        max_feats = int(max_feats)
 
     # Start with minimal set
     base_features = ["y_raw", "y_lag_24", "trend_solar_2h"]
     remaining = [f for f in available if f not in base_features]
+    if max_feats is not None:
+        remaining = remaining[:max_feats]
+        print(f"   FS_MAX_FEATS={max_feats}: capped candidates to {remaining}")
 
     current_best = list(base_features)
-    current_rmse = evaluate_feature_set(grid, tw_test, current_best, max_steps=MAX_STEPS)
-    print(f"\n   Base set {current_best}: RMSE={current_rmse:.3f}")
+    t0 = time.perf_counter()
+    base_metrics = evaluate_feature_set(grid, tw_test, current_best, max_steps=MAX_STEPS)
+    current_rmse = base_metrics["rmse"]
+    current_pct = base_metrics["pct_1c"]
+    print(f"\n   Base set {current_best}: RMSE={current_rmse:.3f} "
+          f"pct<1C={current_pct*100:.1f}% t={time.perf_counter()-t0:.1f}s")
 
     round_num = 0
     while remaining:
         round_num += 1
-        print(f"\n   Round {round_num} (current: {len(current_best)} features, RMSE={current_rmse:.3f})")
+        print(f"\n   Round {round_num} (current: {len(current_best)} features, "
+              f"RMSE={current_rmse:.3f} pct<1C={current_pct*100:.1f}%)")
         print(f"   Testing {len(remaining)} candidates...")
 
         results_round = []
         for feat in remaining:
             test_set = current_best + [feat]
-            rmse = evaluate_feature_set(grid, tw_test, test_set, max_steps=MAX_STEPS)
+            t0 = time.perf_counter()
+            m = evaluate_feature_set(grid, tw_test, test_set, max_steps=MAX_STEPS)
+            dt = time.perf_counter() - t0
+            rmse, pct = m["rmse"], m["pct_1c"]
             improvement = (current_rmse - rmse) / current_rmse * 100 if not np.isnan(rmse) else 0
-            results_round.append((feat, rmse))
-            print(f"      + {feat:>20}: RMSE={rmse:.3f} ({improvement:+.1f}%)", flush=True)
+            d_pct = (pct - current_pct) * 100 if not np.isnan(pct) else 0
+            results_round.append((feat, rmse, pct, dt))
+            print(f"      + {feat:>20}: RMSE={rmse:.3f} ({improvement:+.1f}%) "
+                  f"pct<1C={pct*100:.1f}% ({d_pct:+.1f}pp) t={dt:.1f}s", flush=True)
 
-            # Save after each feature
-            pd.DataFrame(results_round, columns=["feature", "rmse"]).to_csv(
+            pd.DataFrame(results_round,
+                         columns=["feature", "rmse", "pct_1c", "elapsed_s"]).to_csv(
                 str(RESULTS_PATH / f"sweep_round_{round_num}.csv"), index=False)
 
-        # Find best
-        valid_results = [(f, r) for f, r in results_round if not np.isnan(r)]
+        valid_results = [(f, r, p, dt) for f, r, p, dt in results_round if not np.isnan(r)]
         if not valid_results:
             print("   No valid results. Stopping.")
             break
 
-        best_feat, best_rmse = min(valid_results, key=lambda x: x[1])
+        # Selection: lowest RMSE; ties broken by higher pct<1C
+        best_feat, best_rmse, best_pct, _ = min(
+            valid_results, key=lambda x: (x[1], -x[2]))
 
         if best_rmse >= current_rmse - 0.005:
-            print(f"\n   No improvement found. Stopping.")
+            print(f"\n   No improvement (RMSE) found. Stopping.")
             break
 
         current_best.append(best_feat)
         remaining.remove(best_feat)
         current_rmse = best_rmse
-        print(f"   → Added '{best_feat}': new RMSE={current_rmse:.3f}")
+        current_pct = best_pct
+        print(f"   → Added '{best_feat}': new RMSE={current_rmse:.3f} "
+              f"pct<1C={current_pct*100:.1f}%")
 
     print("\n" + "=" * 70)
     print("RESULT: Optimal feature set")
     print("=" * 70)
     print(f"   Features ({len(current_best)}): {current_best}")
-    print(f"   RMSE at 3h (50 steps): {current_rmse:.3f}")
+    print(f"   RMSE at 3h: {current_rmse:.3f}  pct<1C: {current_pct*100:.1f}%")
 
 
 if __name__ == "__main__":

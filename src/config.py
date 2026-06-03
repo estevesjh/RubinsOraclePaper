@@ -13,7 +13,7 @@ import pandas as pd
 # =============================================================================
 
 ROOT_PATH = Path(__file__).parent.parent
-DATA_PATH = ROOT_PATH / "data" / "temp_history_all_dec2025_sunrise_sunset.csv"
+DATA_PATH = ROOT_PATH / "data" / "temp_history_jan2026_with_weather.csv"
 RESULTS_PATH = ROOT_PATH / "results"
 
 # Cache paths

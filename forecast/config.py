@@ -6,7 +6,7 @@ import pandas as pd
 
 # Paths
 ROOT_PATH = Path(__file__).parent.parent
-DATA_PATH = Path("/sdf/home/e/esteves/sitcom-analysis/rubin-twilight-forecast/data/temp_history_jan2026_with_weather.csv")
+DATA_PATH = ROOT_PATH / "data" / "temp_history_jan2026_with_weather.csv"
 RESULTS_PATH = ROOT_PATH / "results"
 MODEL_CACHE_PATH = RESULTS_PATH / "nbeats_diff_cache"
 FIGURES_PATH = ROOT_PATH / "figures"

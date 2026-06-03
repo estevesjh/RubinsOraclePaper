@@ -42,13 +42,17 @@ MODEL_ORDER = [
     "MLP",
     "NBEATSx-Oracle",
     "NBEATSx-Ridge",
+    "NBEATSx-Ridge-MB",
 ]
 
 
 def load_results() -> pd.DataFrame:
-    """Load paper results final."""
+    """Load paper results final (and MB-augmented variant if present)."""
     results_file = RESULTS_PATH / "paper_results_final.csv"
     df = pd.read_csv(results_file)
+    mb_file = RESULTS_PATH / "paper_results_final_mb.csv"
+    if mb_file.exists():
+        df = pd.concat([df, pd.read_csv(mb_file)], ignore_index=True)
     df["twilight_time"] = pd.to_datetime(df["twilight_time"], format="mixed")
     df["forecast_time"] = pd.to_datetime(df["forecast_time"], format="mixed")
     df["abs_error"] = np.abs(df["error"])
@@ -64,8 +68,9 @@ def fig0_dataset_overview():
     # Set seaborn context for better font sizing
     with sns.plotting_context("talk", font_scale=0.9):
         # 1. Load data (timestamps are in UTC)
-        df = pd.read_csv(DATA_PATH)
-        df["ds"] = pd.to_datetime(df["timestamp"])
+        df = pd.read_csv(DATA_PATH, comment="#", low_memory=False)
+        df["ds"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
+        df["y"] = pd.to_numeric(df["mean"], errors="coerce")
         df = df.sort_values("ds").reset_index(drop=True)
 
         # 2. Filter to 2025
@@ -132,7 +137,12 @@ def fig0_dataset_overview():
         ].copy()
 
         # 6. Get twilight and sunrise events for the window (in local time)
-        sunrise_mask = df["sunrise_temp"].notna()
+        # Derive sunrises from alt_sun crossing 0 from below (new CSV has no sunrise_temp column).
+        if "sunrise_temp" not in df.columns:
+            alt_sun = pd.to_numeric(df["alt_sun"], errors="coerce").fillna(method="ffill")
+            sunrise_mask = (alt_sun.shift(1) < 0) & (alt_sun >= 0)
+        else:
+            sunrise_mask = df["sunrise_temp"].notna()
         window_twilights = df[
             (df["ds_local"] >= window_start)
             & (df["ds_local"] <= window_end)
@@ -167,10 +177,10 @@ def fig0_dataset_overview():
         )
         forecast_df["forecast_local_hour"] = forecast_df["forecast_local"].dt.hour
 
-        # Get NBEATSx-Ridge forecasts issued at midday (~6h lead before twilight)
+        # Get NBEATSx-Ridge forecasts issued mid-morning (~9h lead before twilight)
         ridge_9am = forecast_df[
             (forecast_df["model"] == "NBEATSx-Ridge")
-            & (np.abs(forecast_df["lead_time_hours"] - 6.0) < 0.5)
+            & (np.abs(forecast_df["lead_time_hours"] - 9.0) < 0.5)
         ].copy()
 
         # Match forecasts to window twilights
@@ -306,7 +316,7 @@ def fig0_dataset_overview():
 
         # NBEATSx-Ridge forecast stars on all twilights
         for i, (tw_local, forecast_temp) in enumerate(forecast_points):
-            label = "NBEATSx-Ridge \n midday forecast" if i == 0 else None
+            label = "NBEATSx-Blend \n morning forecast" if i == 0 else None
             ax2.plot(
                 tw_local,
                 forecast_temp,
@@ -570,6 +580,12 @@ def fig3_rmse_vs_lead_time():
     fig, ax = plt.subplots(figsize=(10, 7))
     ax.minorticks_on()
 
+    # Optionally append MB-augmented blend if its results exist
+    mb_file = RESULTS_PATH / "paper_results_final_mb.csv"
+    if mb_file.exists():
+        mb_results = pd.read_csv(mb_file)
+        results = pd.concat([results, mb_results], ignore_index=True)
+
     models_to_plot = [
         "Persistence",
         "Prophet",
@@ -577,6 +593,7 @@ def fig3_rmse_vs_lead_time():
         "MLP",
         "Linear",
         "NBEATSx-Ridge",
+        "NBEATSx-Ridge-MB",
     ]
 
     # Color palette: warm for baselines, cool for deep learning
@@ -587,6 +604,7 @@ def fig3_rmse_vs_lead_time():
         "MLP": "#e63946",              # Coral red
         "Linear": "#00b4d8",           # Bright blue
         "NBEATSx-Ridge": "#023e8a",    # Dark navy
+        "NBEATSx-Ridge-MB": "#06d6a0",  # Teal
     }
 
     line_labels = {
@@ -596,6 +614,7 @@ def fig3_rmse_vs_lead_time():
         "MLP": "MLP",
         "Linear": "Linear",
         "NBEATSx-Ridge": "NBEATSx-Blend",
+        "NBEATSx-Ridge-MB": "NBEATSx-Blend + NWP",
     }
 
     lead_times = np.arange(0.5, 12.5, 0.5)
@@ -643,15 +662,46 @@ def fig3_rmse_vs_lead_time():
             markersize=4,
         )
 
-    # Reference lines
+    # Reference lines (in lead-hours data space)
     ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5, linewidth=1.0)
-    ax.axvline(3.0, color="#023e8a", linestyle=":", alpha=0.5, linewidth=1.5)
+    ax.axvline(9.0, color="#023e8a", linestyle=":", alpha=0.5, linewidth=1.5)
 
-    ax.set_xlabel("Lead Time (hours)")
-    ax.set_ylabel("RMSE (°C)")
-    ax.set_title("RMSE vs Lead Time")
-    ax.legend(loc="upper left", framealpha=0.9)
+    # Dual lead-time axis: bottom = equinox-equivalent local clock; top = solar fraction phi.
+    # Forecast target = astro. twilight (alt_sun = -20°) ~ 1h20min after sunset.
+    # By the paper's solar-time definition with night length 12h on the equinox,
+    # phi_tw = 0.5 + (1.33/12)*0.5 ~ 0.555 (NOT 0.58). On the equinox this is
+    # 6am + 0.555*24h = 7:20pm. Mappings (equinox):
+    #   clock_h = 19.33 - lead_h ;   phi = 0.555 - lead_h / 24.
+    PHI_TWILIGHT = 0.555
+    CLOCK_TWILIGHT = 6.0 + PHI_TWILIGHT * 24.0  # = 19.32 h on the equinox
+    clock_to_lead = lambda h: CLOCK_TWILIGHT - h
+    phi_to_lead = lambda phi: 24.0 * (PHI_TWILIGHT - phi)
+    clock_ticks_h = [8, 10, 12, 14, 16, 18, CLOCK_TWILIGHT]
+    clock_labels = ["8am", "10am", "12pm", "2pm", "4pm", "6pm", "astro.\ntwilight"]
+    # Solar fraction equivalent of each clock tick on the equinox: phi = (clock - 6) / 24
+    phi_ticks = [(h - 6.0) / 24.0 for h in clock_ticks_h[:-1]] + [PHI_TWILIGHT]
+    phi_labels = [f"{p:.3f}" for p in phi_ticks]
+
     ax.set_xlim(0, 12.5)
+    ax.set_xticks([clock_to_lead(h) for h in clock_ticks_h])
+    ax.set_xticklabels(clock_labels)
+    ax.invert_xaxis()  # morning (large lead) on left, twilight (lead 0) on right
+    ax.set_xlabel("Local time at forecast issuance (Cerro Pachón)")
+    ax.set_ylabel("RMSE (°C)")
+    ax.set_title("RMSE vs Forecast Issuance Time")
+
+    ax_top = ax.twiny()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_xticks([phi_to_lead(p) for p in phi_ticks])
+    ax_top.set_xticklabels(phi_labels)
+    ax_top.set_xlabel(r"Solar-time fraction $\phi$")
+    ax_top.tick_params(axis="x", direction="in", which="both")
+
+    ax.legend(
+        loc="upper right", framealpha=0.9, fontsize=12,
+        title=r"Top axis: solar fraction $\phi$ (0 sunrise, 0.5 sunset)",
+        title_fontsize=10,
+    )
     ax.set_ylim(0, 3.0)
 
     for spine in ax.spines.values():
@@ -666,10 +716,8 @@ def fig3_rmse_vs_lead_time():
 
 
 def fig5_cdf_absolute_error():
-    """Figure 5: CDF of absolute error at 3h."""
-    print("Generating Figure 5: CDF of absolute error...")
-
-    # Set style
+    """Figure 4 (paper): residual KDE (left) + absolute-error CDF (right) for the morning forecast (9 h before astro. twilight, ~10:20 am local on the equinox)."""
+    print("Generating Figure 5: residual KDE + CDF for the morning forecast (9 h lead)...")
 
     sns.set_theme(
         style="white",
@@ -685,19 +733,16 @@ def fig5_cdf_absolute_error():
         },
     )
 
-    plt.minorticks_on()
-    sns.despine(top=False, right=False, left=False, bottom=False)
-
-    # Load paper_results_final.csv
+    # Load paper_results_final.csv (and optionally MB-augmented variant)
     results_file = RESULTS_PATH / "paper_results_final.csv"
     results = pd.read_csv(results_file)
+    mb_file = RESULTS_PATH / "paper_results_final_mb.csv"
+    if mb_file.exists():
+        mb_results = pd.read_csv(mb_file)
+        results = pd.concat([results, mb_results], ignore_index=True)
     results["abs_error"] = np.abs(results["error"])
-    at_3h = results[np.abs(results["lead_time_hours"] - 3.0) < 0.01]
+    at_3h = results[np.abs(results["lead_time_hours"] - 9.0) < 0.01]
 
-    fig, ax = plt.subplots(figsize=(10, 7))
-    ax.minorticks_on()
-
-    # Same models, colors, and labels as fig3
     models_to_plot = [
         "Persistence",
         "Prophet",
@@ -705,15 +750,17 @@ def fig5_cdf_absolute_error():
         "MLP",
         "Linear",
         "NBEATSx-Ridge",
+        "NBEATSx-Ridge-MB",
     ]
 
     cdf_colors = {
-        "Persistence": "#ffb703",       # Gold/yellow
-        "Prophet": "#8338ec",           # Purple
-        "RandomForest": "#fb8500",      # Orange
-        "MLP": "#e63946",              # Coral red
-        "Linear": "#00b4d8",           # Bright blue
-        "NBEATSx-Ridge": "#023e8a",    # Dark navy
+        "Persistence": "#ffb703",
+        "Prophet": "#8338ec",
+        "RandomForest": "#fb8500",
+        "MLP": "#e63946",
+        "Linear": "#00b4d8",
+        "NBEATSx-Ridge": "#023e8a",
+        "NBEATSx-Ridge-MB": "#06d6a0",
     }
 
     cdf_labels = {
@@ -723,69 +770,104 @@ def fig5_cdf_absolute_error():
         "MLP": "MLP",
         "Linear": "Linear",
         "NBEATSx-Ridge": "NBEATSx-Blend",
+        "NBEATSx-Ridge-MB": "NBEATSx-Blend + NWP",
     }
 
-    # Store NBEATSx-Ridge data for reference line
+    fig, (ax_kde, ax_cdf) = plt.subplots(1, 2, figsize=(16, 7))
+    for ax in (ax_kde, ax_cdf):
+        ax.minorticks_on()
+
+    kde_xmin, kde_xmax = -4.0, 4.0
+    OUTLIER_THRESHOLD = 2.0  # |residual| > this is an outlier (~2x NBEATSx-Blend RMSE)
+
     nbeats_ridge_pct = None
+    outlier_lines = []  # (label, color, pct) for annotation
 
     for model in models_to_plot:
         model_data = at_3h[at_3h["model"] == model]
         if len(model_data) == 0:
             continue
-        sorted_errors = np.sort(model_data["abs_error"])
+        color = cdf_colors[model]
+
+        # ── Left: signed-residual KDE, no fill, lw=2.0, same color as CDF
+        residuals = model_data["error"].values
+        residuals = residuals[np.isfinite(residuals)]
+        if len(residuals) >= 10:
+            sns.kdeplot(
+                residuals,
+                ax=ax_kde,
+                color=color,
+                linewidth=3.0,
+                fill=True,
+                alpha=0.12,
+                clip=(kde_xmin, kde_xmax),
+                bw_adjust=1.0,
+            )
+
+        # Tail-fraction count (mass beyond the visible KDE range)
+        if len(residuals) > 0:
+            outlier_pct = 100.0 * np.mean(np.abs(residuals) > OUTLIER_THRESHOLD)
+            outlier_lines.append((cdf_labels[model], color, outlier_pct))
+
+        # ── Right: absolute-error CDF (no legend; outlier-rate annotation lives here)
+        sorted_errors = np.sort(model_data["abs_error"].values)
         cdf = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
-        ax.plot(
-            sorted_errors,
-            cdf,
-            label=cdf_labels[model],
-            color=cdf_colors[model],
-            linewidth=2.5,
-            linestyle="-",
+        ax_cdf.plot(
+            sorted_errors, cdf,
+            color=color,
+            linewidth=3.0,
         )
+
+        # Provide labelled-line on the KDE panel for legend purposes
+        ax_kde.plot([], [], color=color, linewidth=3.0, label=cdf_labels[model])
 
         if model == "NBEATSx-Ridge":
             nbeats_ridge_pct = (model_data["abs_error"] < 1.0).mean()
 
-    # Reference line at 1°C threshold
-    ax.axvline(
-        1.0, color=cdf_colors["NBEATSx-Ridge"], linestyle="--", alpha=0.7, linewidth=1.5
-    )
+    # ── Left panel cosmetics + legend
+    ax_kde.axvline(0.0, color="black", linestyle="--", alpha=0.4, linewidth=1.0)
+    ax_kde.set_xlabel("Residual (°C)")
+    ax_kde.set_ylabel("Density")
+    ax_kde.set_title("Morning forecast: residual distribution")
+    ax_kde.set_xlim(kde_xmin, kde_xmax)
+    ax_kde.legend(loc="upper left", fontsize=15, framealpha=0.9)
 
-    # Horizontal line for NBEATSx-Blend at 1°C
+    # ── Right panel cosmetics + 1°C reference
+    ax_cdf.axvline(1.0, color=cdf_colors["NBEATSx-Ridge"], linestyle="--",
+                   alpha=0.7, linewidth=1.5)
     if nbeats_ridge_pct is not None:
-        ax.hlines(
-            nbeats_ridge_pct,
-            0,
-            1.0,
-            colors=cdf_colors["NBEATSx-Ridge"],
-            linestyles="--",
-            linewidth=1.5,
-        )
-        ax.plot(
-            1.0, nbeats_ridge_pct, "o", color=cdf_colors["NBEATSx-Ridge"], markersize=8
-        )
-        ax.text(
-            1.05,
-            nbeats_ridge_pct - 0.025,
-            f"{nbeats_ridge_pct * 100:.0f}%",
-            fontsize=12,
-            va="center",
-            color=cdf_colors["NBEATSx-Ridge"],
-            fontweight="bold",
-        )
+        ax_cdf.hlines(nbeats_ridge_pct, 0, 1.0,
+                      colors=cdf_colors["NBEATSx-Ridge"], linestyles="--", linewidth=1.5)
+        ax_cdf.plot(1.0, nbeats_ridge_pct, "o",
+                    color=cdf_colors["NBEATSx-Ridge"], markersize=8)
+        ax_cdf.text(1.05, nbeats_ridge_pct - 0.025,
+                    f"{nbeats_ridge_pct * 100:.0f}%",
+                    fontsize=12, va="center",
+                    color=cdf_colors["NBEATSx-Ridge"], fontweight="bold")
+    ax_cdf.set_xlabel("Absolute Error (°C)")
+    ax_cdf.set_ylabel("Cumulative Probability")
+    ax_cdf.set_title("Morning forecast: CDF of |error|")
+    ax_cdf.set_xlim(0, 4.0)
+    ax_cdf.set_ylim(0, 1)
 
-    ax.set_xlabel("Absolute Error (°C)")
-    ax.set_ylabel("Cumulative Probability")
-    ax.set_title("CDF of Absolute Error at 3h Lead Time")
-    ax.legend(loc="lower right")
-    ax.set_xlim(0, 3.0)
-    ax.set_ylim(0, 1)
+    # Outlier-fraction annotation: header + each model on its own line, color-coded
+    header = f"Outlier fraction |res| > {OUTLIER_THRESHOLD:.0f}°C"
+    ax_cdf.text(0.97, 0.55, header,
+                transform=ax_cdf.transAxes, ha="right", va="top",
+                fontsize=15, fontweight="bold", color="black",
+                bbox=dict(facecolor="white", edgecolor="lightgray", alpha=0.85, pad=4))
+    for i, (lbl, c, pct) in enumerate(outlier_lines):
+        ax_cdf.text(0.97, 0.48 - 0.05 * i,
+                    f"{lbl}: {pct:.1f}%",
+                    transform=ax_cdf.transAxes, ha="right", va="top",
+                    fontsize=13, color=c)
 
-    # Black borders
-    for spine in ax.spines.values():
-        spine.set_color("black")
-        spine.set_linewidth(1.5)
-    paper_ticks(ax)
+    for ax in (ax_kde, ax_cdf):
+        for spine in ax.spines.values():
+            spine.set_color("black")
+            spine.set_linewidth(1.5)
+        paper_ticks(ax)
+
     plt.tight_layout()
     plt.savefig(FIGURES_PATH / "fig5_cdf_error.png", dpi=150, bbox_inches="tight")
     plt.savefig(FIGURES_PATH / "fig5_cdf_error.pdf", bbox_inches="tight")
@@ -794,14 +876,33 @@ def fig5_cdf_absolute_error():
 
 
 def fig6_seasonal_trend_analysis():
-    """Figure 6: Seasonal effects and temperature trend analysis."""
-    print("Generating Figure 6: Seasonal and Trend Analysis...")
+    """Figure 6: Seasonal residual KDE (left) + per-season CDF of |error| (right).
+
+    Mirrors fig5's structure but slices a single model (NBEATSx-Blend at the morning
+    forecast) by Southern-hemisphere season instead of by model.
+    """
+    print("Generating Figure 6: Seasonal residual KDE + CDF...")
+
+    # Match fig3 / fig5 theme + context
+    sns.set_theme(
+        style="white",
+        context="paper",
+        font_scale=1.8,
+        rc={
+            "axes.linewidth": 1.5,
+            "lines.linewidth": 2.0,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.top": True,
+            "ytick.right": True,
+        },
+    )
 
     results = load_results()
 
-    # Focus on NBEATSx-Ridge at 3h
+    # Focus on NBEATSx-Ridge at the morning lead (9 h before astro. twilight)
     df = results[
-        (results["model"] == "NBEATSx-Ridge") & (results["lead_time_hours"] == 3.0)
+        (results["model"] == "NBEATSx-Ridge") & (results["lead_time_hours"] == 9.0)
     ].copy()
     df["twilight_time"] = pd.to_datetime(df["twilight_time"])
     df["month"] = df["twilight_time"].dt.month
@@ -840,129 +941,90 @@ def fig6_seasonal_trend_analysis():
         else:
             return "Strong warming"
 
-    df["trend_category"] = df["temp_diff_3d"].apply(categorize_trend)
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # Panel 1: Error distribution by season (box plot)
-    ax1 = axes[0, 0]
     season_order = ["Summer", "Fall", "Winter", "Spring"]
-    # Use RdYlBu colormap for seasons
-    cmap = plt.cm.RdYlBu
+    # Paper palette: Summer=red, Fall=orange, Winter=navy, Spring=teal
     season_colors = {
-        "Summer": cmap(0.1),   # Red (hot)
-        "Fall": cmap(0.35),    # Orange/Yellow
-        "Winter": cmap(0.9),   # Blue (cold)
-        "Spring": cmap(0.65),  # Light blue
+        "Summer": "#e63946",
+        "Fall":   "#fb8500",
+        "Winter": "#00b4d8",  # Bright blue (Linear color, paper palette)
+        "Spring": "#8338ec",  # Purple (blooming flowers, paper palette)
     }
 
-    box_data = [df[df["season"] == s]["error"].dropna().values for s in season_order]
-    bp = ax1.boxplot(box_data, labels=season_order, patch_artist=True)
-    for patch, season in zip(bp["boxes"], season_order):
-        patch.set_facecolor(season_colors[season])
-        patch.set_alpha(0.6)
-    ax1.axhline(0, color="black", linestyle="--", linewidth=1)
-    ax1.set_ylabel("Prediction Error (°C)")
-    ax1.set_title("Error Distribution by Season")
-    ax1.grid(True, alpha=0.3)
+    fig, (ax_kde, ax_cdf) = plt.subplots(1, 2, figsize=(16, 7))
+    for ax in (ax_kde, ax_cdf):
+        ax.minorticks_on()
 
-    # Panel 2: Percentage within thresholds by season
-    ax2 = axes[0, 1]
-    season_stats = []
-    for s in season_order:
-        subset = df[df["season"] == s]
-        abs_error = np.abs(subset["error"])
-        season_stats.append(
-            {
-                "season": s,
-                "pct_05": (abs_error < 0.5).mean() * 100,
-                "pct_1": (abs_error < 1.0).mean() * 100,
-                "n": len(subset),
-            }
+    kde_xmin, kde_xmax = -4.0, 4.0
+    OUTLIER_THRESHOLD = 2.0
+    outlier_lines = []  # (label, color, pct, n)
+
+    for season in season_order:
+        sub = df[df["season"] == season]
+        residuals = sub["error"].values
+        residuals = residuals[np.isfinite(residuals)]
+        if len(residuals) < 10:
+            continue
+        color = season_colors[season]
+        label = f"{season} (n={len(residuals)})"
+
+        # Left: KDE of signed residuals
+        sns.kdeplot(
+            residuals,
+            ax=ax_kde,
+            color=color,
+            linewidth=3.0,
+            fill=True,
+            alpha=0.12,
+            clip=(kde_xmin, kde_xmax),
+            bw_adjust=1.0,
+            label=label,
         )
-    stats_df = pd.DataFrame(season_stats)
 
-    x = np.arange(len(season_order))
-    width = 0.35
-    ax2.bar(
-        x - width / 2,
-        stats_df["pct_05"],
-        width,
-        label="< 0.5°C",
-        color="steelblue",
-        alpha=0.8,
-    )
-    ax2.bar(
-        x + width / 2, stats_df["pct_1"], width, label="< 1°C", color="coral", alpha=0.8
-    )
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([f"{s}\n(n={n})" for s, n in zip(season_order, stats_df["n"])])
-    ax2.set_ylabel("Percentage (%)")
-    ax2.set_title("Forecast Accuracy by Season")
-    ax2.legend()
-    ax2.set_ylim(0, 105)
-    ax2.grid(True, alpha=0.3, axis="y")
+        # Right: CDF of |error|
+        abs_err = np.sort(np.abs(residuals))
+        cdf = np.arange(1, len(abs_err) + 1) / len(abs_err)
+        ax_cdf.plot(
+            abs_err, cdf,
+            color=color,
+            linewidth=3.0,
+        )
 
-    # Panel 3: Bias by season
-    ax3 = axes[1, 0]
-    bias_by_season = df.groupby("season")["error"].mean().reindex(season_order)
-    colors = [season_colors[s] for s in season_order]
-    bars = ax3.bar(
-        season_order, bias_by_season.values, color=colors, alpha=0.7, edgecolor="black"
-    )
-    ax3.axhline(0, color="black", linestyle="-", linewidth=1)
-    ax3.set_ylabel("Bias (°C)")
-    ax3.set_title("Prediction Bias by Season")
-    ax3.grid(True, alpha=0.3, axis="y")
+        outlier_pct = 100.0 * np.mean(np.abs(residuals) > OUTLIER_THRESHOLD)
+        outlier_lines.append((season, color, outlier_pct))
 
-    # Panel 4: RMS by temperature trend category
-    ax4 = axes[1, 1]
-    trend_order = [
-        "Strong cooling",
-        "Moderate cooling",
-        "Stable",
-        "Moderate warming",
-        "Strong warming",
-    ]
-    trend_colors = ["#2166ac", "#67a9cf", "#f7f7f7", "#ef8a62", "#b2182b"]
+    # Left panel cosmetics
+    ax_kde.axvline(0.0, color="black", linestyle="--", alpha=0.4, linewidth=1.0)
+    ax_kde.set_xlabel("Residual (°C)")
+    ax_kde.set_ylabel("Density")
+    ax_kde.set_title("Morning forecast: residual by season")
+    ax_kde.set_xlim(kde_xmin, kde_xmax)
+    ax_kde.legend(loc="upper left", fontsize=15, framealpha=0.9)
 
-    trend_stats = []
-    for t in trend_order:
-        subset = df[df["trend_category"] == t]
-        if len(subset) > 5:
-            trend_stats.append(
-                {
-                    "trend": t,
-                    "rmse": np.sqrt((subset["error"] ** 2).mean()),
-                    "n": len(subset),
-                }
-            )
-        else:
-            trend_stats.append({"trend": t, "rmse": np.nan, "n": len(subset)})
+    # Right panel cosmetics + outlier-fraction box (mirrors fig5)
+    ax_cdf.axvline(1.0, color="black", linestyle="--", alpha=0.5, linewidth=1.5)
+    ax_cdf.set_xlabel("Absolute Error (°C)")
+    ax_cdf.set_ylabel("Cumulative Probability")
+    ax_cdf.set_title("Morning forecast: CDF of |error| by season")
+    ax_cdf.set_xlim(0, 4.0)
+    ax_cdf.set_ylim(0, 1)
 
-    trend_df = pd.DataFrame(trend_stats)
-    valid_mask = ~trend_df["rmse"].isna()
+    header = f"Outlier fraction |res| > {OUTLIER_THRESHOLD:.0f}°C"
+    ax_cdf.text(0.97, 0.55, header,
+                transform=ax_cdf.transAxes, ha="right", va="top",
+                fontsize=15, fontweight="bold", color="black",
+                bbox=dict(facecolor="white", edgecolor="lightgray", alpha=0.85, pad=4))
+    for i, (lbl, c, pct) in enumerate(outlier_lines):
+        ax_cdf.text(0.97, 0.48 - 0.05 * i,
+                    f"{lbl}: {pct:.1f}%",
+                    transform=ax_cdf.transAxes, ha="right", va="top",
+                    fontsize=13, color=c)
 
-    bars = ax4.bar(
-        range(len(trend_order)),
-        trend_df["rmse"].values,
-        color=trend_colors,
-        edgecolor="black",
-        alpha=0.8,
-    )
-    ax4.set_xticks(range(len(trend_order)))
-    ax4.set_xticklabels(
-        [f"{t}\n(n={n})" for t, n in zip(trend_order, trend_df["n"])],
-        fontsize=8,
-        rotation=15,
-        ha="right",
-    )
-    ax4.set_ylabel("RMSE (°C)")
-    ax4.set_title(
-        "RMS Error by Temperature Trend Category\n(based on 3-twilight temperature change)"
-    )
-    ax4.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
-    ax4.grid(True, alpha=0.3, axis="y")
+    # Apply fig3/5-style spines + inward ticks
+    for ax in (ax_kde, ax_cdf):
+        for spine in ax.spines.values():
+            spine.set_color("black")
+            spine.set_linewidth(1.5)
+        paper_ticks(ax)
 
     plt.tight_layout()
     plt.savefig(
@@ -1249,36 +1311,47 @@ def fig8_comparison_nbeats_prophet_meteoblue():
     df = pd.read_csv(results_file)
     df["twilight_time"] = pd.to_datetime(df["twilight_time"])
 
-    # NBEATSx and Prophet at 6h lead; MeteoBlue uses all available
-    nbeats_df = df[(df["model"] == "NBEATSx-Ridge") & (np.abs(df["lead_time_hours"] - 6.0) < 0.01)].copy()
-    prophet_df = df[(df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 6.0) < 0.5)].copy()
+    # Append MB-augmented blend results if available (same pattern as fig3)
+    mb_file = RESULTS_PATH / "paper_results_final_mb.csv"
+    if mb_file.exists():
+        mb_df = pd.read_csv(mb_file)
+        mb_df["twilight_time"] = pd.to_datetime(mb_df["twilight_time"])
+        df = pd.concat([df, mb_df], ignore_index=True)
+
+    # NBEATSx and Prophet at 9h lead (morning); MeteoBlue uses all available
+    nbeats_df = df[(df["model"] == "NBEATSx-Ridge") & (np.abs(df["lead_time_hours"] - 9.0) < 0.01)].copy()
+    nbeats_nwp_df = df[(df["model"] == "NBEATSx-Ridge-MB") & (np.abs(df["lead_time_hours"] - 9.0) < 0.01)].copy()
+    prophet_df = df[(df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 9.0) < 0.5)].copy()
     meteoblue_df = df[df["model"] == "MeteoBlue"].copy()
 
-    print(f"  NBEATSx-Blend (6h): {len(nbeats_df)} points")
-    print(f"  Prophet (6h): {len(prophet_df)} points")
+    print(f"  NBEATSx-Blend (9h): {len(nbeats_df)} points")
+    print(f"  NBEATSx-Blend+NWP (9h): {len(nbeats_nwp_df)} points")
+    print(f"  Prophet (9h): {len(prophet_df)} points")
     print(f"  MeteoBlue (all): {len(meteoblue_df)} points")
 
-    # Colors (matching fig5 CDF palette)
+    # Colors (matching fig3 / paper palette)
     colors = {
-        "NBEATSx-Ridge": "#023e8a",  # Dark navy
-        "Prophet": "#00b4d8",  # Bright blue
-        "MeteoBlue": "#e63946",  # Coral red
+        "NBEATSx-Ridge": "#023e8a",     # Navy
+        "NBEATSx-Ridge-MB": "#06d6a0",  # Teal
+        "Prophet": "#8338ec",           # Purple
+        "MeteoBlue": "#e63946",         # Coral red
     }
 
-    # Create 2x3 figure
+    # Create 2x4 figure
     fig, axes = plt.subplots(
         2,
-        3,
-        figsize=(18, 10),
+        4,
+        figsize=(24, 10),
         gridspec_kw={"height_ratios": [1.75, 1.0], "wspace": 0, "hspace": 0},
         sharex="col",
         sharey="row",
     )
 
     datasets = [
-        (nbeats_df, "NBEATSx-Blend (mid-day)", colors["NBEATSx-Ridge"]),
-        (prophet_df, "Prophet (mid-day)", colors["Prophet"]),
-        (meteoblue_df, "MeteoBlue", colors["MeteoBlue"]),
+        (nbeats_df, "NBEATSx-Blend (morning)", colors["NBEATSx-Ridge"]),
+        (nbeats_nwp_df, "NBEATSx-Blend+NWP (morning)", colors["NBEATSx-Ridge-MB"]),
+        (prophet_df, "Prophet (morning)", colors["Prophet"]),
+        (meteoblue_df, "MeteoBlue (NWP)", colors["MeteoBlue"]),
     ]
 
     for col, (data_df, title, color) in enumerate(datasets):
@@ -1362,13 +1435,14 @@ def fig8_comparison_nbeats_prophet_meteoblue():
         ss_tot = float(np.sum((yi - np.mean(yi)) ** 2)) if n_in > 0 else np.nan
         r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
 
-        # Stats text box
+        # Stats text box (Std is residual std about the fit, i.e. bias-removed)
         txt = (
             f"N = {n_in}\n"
             f"Slope = {b:.2f}\n"
             f"Bias = {bias:.2f} °C\n"
-            f"Std = {std:.2f} °C\n"
-            f"R² = {r2:.2f}"
+            f"Std$_*$ = {std:.2f} °C\n"
+            f"R² = {r2:.2f}\n"
+            f"$_*$bias-subtracted"
         )
         ax_top.text(
             0.02,
