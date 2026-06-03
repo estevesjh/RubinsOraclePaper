@@ -42,7 +42,6 @@ MODEL_ORDER = [
     "MLP",
     "NBEATSx-Oracle",
     "NBEATSx-Ridge",
-    "NBEATSx-Ridge-MB",
 ]
 
 
@@ -593,7 +592,6 @@ def fig3_rmse_vs_lead_time():
         "MLP",
         "Linear",
         "NBEATSx-Ridge",
-        "NBEATSx-Ridge-MB",
     ]
 
     # Color palette: warm for baselines, cool for deep learning
@@ -604,7 +602,6 @@ def fig3_rmse_vs_lead_time():
         "MLP": "#e63946",              # Coral red
         "Linear": "#00b4d8",           # Bright blue
         "NBEATSx-Ridge": "#023e8a",    # Dark navy
-        "NBEATSx-Ridge-MB": "#06d6a0",  # Teal
     }
 
     line_labels = {
@@ -614,7 +611,6 @@ def fig3_rmse_vs_lead_time():
         "MLP": "MLP",
         "Linear": "Linear",
         "NBEATSx-Ridge": "NBEATSx-Blend",
-        "NBEATSx-Ridge-MB": "NBEATSx-Blend + NWP",
     }
 
     lead_times = np.arange(0.5, 12.5, 0.5)
@@ -750,7 +746,6 @@ def fig5_cdf_absolute_error():
         "MLP",
         "Linear",
         "NBEATSx-Ridge",
-        "NBEATSx-Ridge-MB",
     ]
 
     cdf_colors = {
@@ -760,7 +755,6 @@ def fig5_cdf_absolute_error():
         "MLP": "#e63946",
         "Linear": "#00b4d8",
         "NBEATSx-Ridge": "#023e8a",
-        "NBEATSx-Ridge-MB": "#06d6a0",
     }
 
     cdf_labels = {
@@ -770,7 +764,6 @@ def fig5_cdf_absolute_error():
         "MLP": "MLP",
         "Linear": "Linear",
         "NBEATSx-Ridge": "NBEATSx-Blend",
-        "NBEATSx-Ridge-MB": "NBEATSx-Blend + NWP",
     }
 
     fig, (ax_kde, ax_cdf) = plt.subplots(1, 2, figsize=(16, 7))
@@ -1320,28 +1313,25 @@ def fig8_comparison_nbeats_prophet_meteoblue():
 
     # NBEATSx and Prophet at 9h lead (morning); MeteoBlue uses all available
     nbeats_df = df[(df["model"] == "NBEATSx-Ridge") & (np.abs(df["lead_time_hours"] - 9.0) < 0.01)].copy()
-    nbeats_nwp_df = df[(df["model"] == "NBEATSx-Ridge-MB") & (np.abs(df["lead_time_hours"] - 9.0) < 0.01)].copy()
     prophet_df = df[(df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 9.0) < 0.5)].copy()
     meteoblue_df = df[df["model"] == "MeteoBlue"].copy()
 
     print(f"  NBEATSx-Blend (9h): {len(nbeats_df)} points")
-    print(f"  NBEATSx-Blend+NWP (9h): {len(nbeats_nwp_df)} points")
     print(f"  Prophet (9h): {len(prophet_df)} points")
     print(f"  MeteoBlue (all): {len(meteoblue_df)} points")
 
     # Colors (matching fig3 / paper palette)
     colors = {
         "NBEATSx-Ridge": "#023e8a",     # Navy
-        "NBEATSx-Ridge-MB": "#06d6a0",  # Teal
         "Prophet": "#8338ec",           # Purple
         "MeteoBlue": "#e63946",         # Coral red
     }
 
-    # Create 2x4 figure
+    # Create 2x3 figure
     fig, axes = plt.subplots(
         2,
-        4,
-        figsize=(24, 10),
+        3,
+        figsize=(18, 10),
         gridspec_kw={"height_ratios": [1.75, 1.0], "wspace": 0, "hspace": 0},
         sharex="col",
         sharey="row",
@@ -1349,7 +1339,6 @@ def fig8_comparison_nbeats_prophet_meteoblue():
 
     datasets = [
         (nbeats_df, "NBEATSx-Blend (morning)", colors["NBEATSx-Ridge"]),
-        (nbeats_nwp_df, "NBEATSx-Blend+NWP (morning)", colors["NBEATSx-Ridge-MB"]),
         (prophet_df, "Prophet (morning)", colors["Prophet"]),
         (meteoblue_df, "MeteoBlue (NWP)", colors["MeteoBlue"]),
     ]

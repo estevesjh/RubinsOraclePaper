@@ -214,23 +214,7 @@ def main():
 
     blend_df = blend_with_linear(nb_diff, "NBEATSx-Ridge")
     rmse_3h = np.sqrt((blend_df[blend_df["lead_time_hours"] == 3.0]["error"] ** 2).mean())
-    print(f"   NBEATSx-Ridge (no-MB) RMSE at 3h: {rmse_3h:.3f}, rows: {len(blend_df)}")
-
-    # Optional with-MB variant: read paper_results_diff_nwp.csv if present.
-    nwp_file = RESULTS_PATH / "paper_results_diff_nwp.csv"
-    blend_mb_df = pd.DataFrame()
-    if nwp_file.exists():
-        nb_mb_raw = pd.read_csv(nwp_file)
-        nb_mb_diff = nb_mb_raw[nb_mb_raw["model"] == "NBEATSx-Diff"].copy()
-        if 12.0 not in nb_mb_diff["lead_time_hours"].values and 11.5 in nb_mb_diff["lead_time_hours"].values:
-            nb_12h = nb_mb_diff[nb_mb_diff["lead_time_hours"] == 11.5].copy()
-            nb_12h["lead_time_hours"] = 12.0
-            nb_mb_diff = pd.concat([nb_mb_diff, nb_12h], ignore_index=True)
-        blend_mb_df = blend_with_linear(nb_mb_diff, "NBEATSx-Ridge-MB")
-        rmse_mb_3h = np.sqrt((blend_mb_df[blend_mb_df["lead_time_hours"] == 3.0]["error"] ** 2).mean())
-        print(f"   NBEATSx-Ridge-MB RMSE at 3h: {rmse_mb_3h:.3f}, rows: {len(blend_mb_df)}")
-    else:
-        print(f"   {nwp_file.name} not found — skipping NWP variant.")
+    print(f"   NBEATSx-Ridge RMSE at 3h: {rmse_3h:.3f}, rows: {len(blend_df)}")
 
     # 6. Prophet + MeteoBlue
     print("\n6. Adding Prophet + MeteoBlue...")
@@ -243,7 +227,7 @@ def main():
 
     # 7. Combine and save
     print("\n7. Saving paper_results_final.csv...")
-    combined = pd.concat([blend_df, blend_mb_df, baseline_df, persist_df, prophet_df, mb_df], ignore_index=True)
+    combined = pd.concat([blend_df, baseline_df, persist_df, prophet_df, mb_df], ignore_index=True)
     # Standardize timestamps
     combined["twilight_time"] = pd.to_datetime(combined["twilight_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
     combined["forecast_time"] = pd.to_datetime(combined["forecast_time"], format="mixed").dt.strftime("%Y-%m-%d %H:%M:%S.000")
