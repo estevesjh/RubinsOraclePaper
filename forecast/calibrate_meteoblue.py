@@ -69,13 +69,19 @@ def main():
     valid_col = "valid_time_utc" if "valid_time_utc" in mb.columns else "valid_time"
     mb["valid_time"] = pd.to_datetime(mb[valid_col], utc=True).dt.tz_localize(None)
     mb = mb[mb["lead_hours"] > 0].copy()  # causal only
+
+    # For each valid_time we may have several causal forecasts (different
+    # issue_times, hence different lead_hours). Keep the one with the
+    # SHORTEST lead, i.e. the most recent forecast that still respects
+    # causality. After this we have exactly one row per valid_time.
     mb_latest = (
-        mb.sort_values(["valid_time", "lead_hours"])
-          .drop_duplicates("valid_time", keep="first")
+        mb.sort_values(["valid_time", "lead_hours"])  # ascending lead within each valid_time
+          .drop_duplicates("valid_time", keep="first")  # keep min(lead_hours)
           [["valid_time", "temperature"]]
           .set_index("valid_time")
           .sort_index()
     )
+    assert mb_latest.index.is_unique, "mb_latest must have one row per valid_time"
 
     # Interpolate MeteoBlue temperature onto the solar-time grid in time:
     # for each ds_real (int64 ns), linearly interpolate between adjacent
@@ -88,6 +94,12 @@ def main():
     )
     out = (ds_real < mb_latest.index.min()) | (ds_real > mb_latest.index.max())
     mb_raw[out] = np.nan
+
+    # Sanity: exactly one MB temperature value per solar-time grid step.
+    assert mb_raw.shape == y_arr.shape, (
+        f"mb_raw must have one value per grid step "
+        f"(expected {y_arr.shape}, got {mb_raw.shape})"
+    )
 
     # Fit per-bin slope + bias on TRAIN (pre-2025) only
     train_mask = ds_real < TEST_START_DATE
