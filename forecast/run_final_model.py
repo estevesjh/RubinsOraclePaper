@@ -32,19 +32,43 @@ from config import (NBEATS_INPUT_SIZE, NBEATS_HORIZON, RESULTS_PATH,
 
 WIDTH = 16
 MAX_STEPS = NBEATS_MAX_STEPS
+# Derivative-aware loss weight (slope term). LAMBDA=0.0 == stock HuberLoss
+# (paper baseline). Set >0 only after the exp_traj_loss.py gate confirms the
+# slope-RMSE gain without a 3h point-RMSE regression.
+LAMBDA = 0.0
 NB_HIST = ["y_raw", "y_lag_24", "trend_solar_2h", "y_diff_24h"]
 NB_FUTR = ["solar_sin", "solar_cos", "doy_sin", "doy_cos"]
+# Paper baseline Ridge features (used at SHORT leads, where the target is easy and
+# extra features only add estimation variance — see docs/winter_spring_plan.md §3.6).
 RIDGE_FEATS = [
     "y_raw", "y_lag_6", "y_lag_12", "y_lag_24", "y_lag_48",
     "trend_solar_2h", "solar_sin", "solar_cos", "doy_sin", "doy_cos",
     "trend_solar_4h", "velocity_noon", "dmean_1d",
 ]
+# Long-lead additions: multi-day trend + binned humidity + DIRECTIONAL wind.
+# Best config in the study (+trend+hw_dir_rhbin, docs/winter_spring_plan.md §3.10):
+# 9h winter -8.0%, spring -5.5%. RH is encoded as tercile dummies (rh_mid,
+# rh_high) rather than a linear coefficient because the spring humidity effect is
+# nonlinear (flat at low/mid RH, strong only at high RH); the binned form also
+# halves the short-lead variance penalty. Still LEAD-GATED (>= LEAD_GATE_HOURS).
+TREND_FEATS = ["y_diff_45h", "y_diff_30h", "last_std_24h", "DTR_3d"]
+HW_DIR_FEATS = ["rh_mid", "rh_high", "hum_std_24h",
+                "wind_u_par", "wind_u_perp", "wind_u_par_NE"]
+LEAD_GATE_HOURS = 5.0   # leads >= this use the augmented feature set
+
+
+def ridge_feats_for_lead(L, grid_cols):
+    """Lead-gated feature set: paper features at short lead, +trend+hw_dir at long."""
+    feats = list(RIDGE_FEATS)
+    if L >= LEAD_GATE_HOURS:
+        feats = feats + TREND_FEATS + HW_DIR_FEATS
+    return [c for c in feats if c in grid_cols]
 
 
 def train_nbeats(grid):
     from neuralforecast import NeuralForecast
-    from neuralforecast.losses.pytorch import HuberLoss
     from neuralforecast.models import NBEATSx
+    from traj_loss import TrajHuberLoss
 
     hist = [c for c in NB_HIST if c in grid.columns]
     futr = [c for c in NB_FUTR if c in grid.columns]
@@ -56,7 +80,7 @@ def train_nbeats(grid):
     model = NBEATSx(
         h=NBEATS_HORIZON, input_size=NBEATS_INPUT_SIZE, max_steps=MAX_STEPS,
         hist_exog_list=hist, futr_exog_list=futr,
-        activation="SELU", loss=HuberLoss(), learning_rate=0.001,
+        activation="SELU", loss=TrajHuberLoss(lam=LAMBDA), learning_rate=0.001,
         batch_size=48, scaler_type="identity", enable_progress_bar=True,
         enable_model_summary=False,
         stack_types=["trend","seasonality","identity","exogenous"],
@@ -108,16 +132,22 @@ def get_all_preds(nf, grid, tw_set, hist, futr, leads):
             u=fc[fc["unique_id"]==uid].sort_values("ds").reset_index(drop=True)
             ps=tgt-iss
             if len(u)==0 or ps>=len(u): continue
-            preds[(ev_i, L)] = {"T_nb": float(u[mc].iloc[ps]),
+            yhat_full=u[mc].to_numpy()   # full forward trajectory (~26 steps)
+            preds[(ev_i, L)] = {"T_nb": float(yhat_full[ps]), "yhat_traj": yhat_full,
                                 "y_actual": yact, "iss": iss, "ds_real": ds_r}
     return preds
 
 
 def train_and_apply_ridge(grid, train_preds, test_preds, leads):
-    """Train Ridge per-lead on train, apply to test. Returns list of result rows."""
-    feat_cols = [c for c in RIDGE_FEATS if c in grid.columns]
+    """Train Ridge per-lead on train, apply to test. Returns list of result rows.
+
+    Features are LEAD-GATED (ridge_feats_for_lead): short leads use the paper
+    feature set; long leads (>= LEAD_GATE_HOURS) add multi-day trend + humidity +
+    directional-wind features that reduce winter/spring morning-forecast error.
+    """
     rows = []
     for L in leads:
+        feat_cols = ridge_feats_for_lead(L, grid.columns)
         # Build train
         X_tr, y_tr = [], []
         for (ev_i, lead), p in train_preds.items():
@@ -161,6 +191,10 @@ def main():
     # Add extra features needed by Ridge (not in run.py's standard load)
     import feature_sweep as fs
     grid = fs.compute_all_features(grid)
+    # Merge humidity + directional-wind features (causal, imputed pre-2025
+    # climatology). Used only at long leads via lead-gating. See exp_humidity.py.
+    import exp_humidity as eh
+    grid = eh.merge_humidity(grid)
 
     tw = run.find_twilight_targets(grid)
     tw["ds_real"] = pd.to_datetime(tw["ds_real"])

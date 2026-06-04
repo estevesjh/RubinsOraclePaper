@@ -224,3 +224,6 @@ docs/spie_paper.pdf
 id_ed25519
 id_ed25519.pub
 *.blg
+
+# Local Claude Code session config (not shared)
+.claude/
