@@ -29,7 +29,7 @@ SOLAR_GRID_FREQ = "1800s"
 # NBEATSx model
 NBEATS_INPUT_SIZE = 48        # 1 solar day lookback
 NBEATS_HORIZON = 26           # covers up to 12h lead
-NBEATS_MAX_STEPS = 2000       # max_steps sweep showed monotonic RMSE gains to 2000 (early-stop guards overfit)
+NBEATS_MAX_STEPS = 700        # width=16 optimum (small net resists overfit; RMSE flat past ~700)
 
 # Evaluation lead times (0.5h steps, max 12h due to 12h differencing anchor)
 LEAD_TIMES_HOURS = list(np.arange(0.5, 12.5, 0.5))

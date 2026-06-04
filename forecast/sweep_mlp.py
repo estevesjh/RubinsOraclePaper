@@ -33,7 +33,7 @@ from config import (  # noqa: E402
 )
 
 # Widths to sweep — each is the per-block hidden layer [w, w] x 4 stacks.
-WIDTHS = [32, 256, 512, 1024, 2048]
+WIDTHS = [16, 32, 64, 128, 256, 512, 1024, 2048]
 KEY_LEADS = [0.5, 1.0, 3.0, 6.0, 12.0]
 
 
@@ -75,7 +75,9 @@ def train_timed(grid, model):
     futr_exog = [c for c in futr_exog if c in grid.columns]
     all_exog = hist_exog + futr_exog
 
-    nf_train = grid[["ds", "D"] + all_exog].dropna().copy()
+    # Train strictly pre-2025 (test set is all 2025; avoid leakage).
+    train_mask = pd.to_datetime(grid["ds_real"]) < TEST_START_DATE
+    nf_train = grid.loc[train_mask, ["ds", "D"] + all_exog].dropna().copy()
     nf_train["y"] = nf_train["D"]
     nf_train["unique_id"] = "temp"
     val_size = int(len(nf_train) * 0.1)

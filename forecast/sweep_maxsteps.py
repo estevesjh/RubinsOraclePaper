@@ -31,8 +31,8 @@ from config import (  # noqa: E402
     SOLAR_GRID_FREQ, TEST_START_DATE,
 )
 
-WIDTH = 256
-MAX_STEPS_GRID = [100, 250, 500, 1000, 2000]
+WIDTH = int(os.environ.get("MS_WIDTH", 16))
+MAX_STEPS_GRID = [100, 150, 200, 250, 300, 400, 500, 700, 900, 1200, 1500, 2000]
 KEY_LEADS = [0.5, 1.0, 3.0, 6.0, 12.0]
 
 
@@ -72,7 +72,9 @@ def train_timed(grid, model):
     futr_exog = [c for c in futr_exog if c in grid.columns]
     all_exog = hist_exog + futr_exog
 
-    nf_train = grid[["ds", "D"] + all_exog].dropna().copy()
+    # Train strictly pre-2025 (test set is all 2025; avoid leakage).
+    train_mask = pd.to_datetime(grid["ds_real"]) < TEST_START_DATE
+    nf_train = grid.loc[train_mask, ["ds", "D"] + all_exog].dropna().copy()
     nf_train["y"] = nf_train["D"]
     nf_train["unique_id"] = "temp"
     val_size = int(len(nf_train) * 0.1)

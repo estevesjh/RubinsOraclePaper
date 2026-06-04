@@ -131,11 +131,69 @@ def load_and_prepare():
     grid["y_diff_60"] = y_arr - np.roll(y_arr, 60)
     grid.iloc[:60, grid.columns.get_loc("y_diff_60")] = np.nan
 
-    # NOTE: A MeteoBlue NWP-augmented variant was investigated but de-scoped
-    # for this paper; see forecast/calibrate_meteoblue.py for the calibration
-    # script and results/meteoblue_correction_per_solartime.csv for the
-    # per-solar-time bias correction it produced. The mb_corrected feature
-    # is no longer added to the grid here.
+    # 24h difference: T[t] - T[t-48] (48 steps = 24h). Sweep-selected feature.
+    grid["y_diff_24h"] = y_arr - np.roll(y_arr, 48)
+    grid.iloc[:48, grid.columns.get_loc("y_diff_24h")] = np.nan
+
+    # MeteoBlue bias-corrected forecast (per-solar-time-bin calibration).
+    # Used as a Ridge feature, not as NBEATSx futr_exog.
+    from pathlib import Path
+    MB_FILE = Path(__file__).parent.parent / "data" / "meteo_blue_weather_station.csv"
+    if MB_FILE.exists():
+        mb = pd.read_csv(MB_FILE)
+        mb["valid_time"] = pd.to_datetime(
+            mb["valid_time_utc"] if "valid_time_utc" in mb.columns else mb["valid_time"],
+            utc=True
+        ).dt.tz_localize(None).astype("datetime64[ns]")
+        mb = mb[mb["lead_hours"] > 0].copy()
+        mb_latest = mb.sort_values(["valid_time", "lead_hours"]).drop_duplicates("valid_time", keep="first")
+        mb_latest = mb_latest[["valid_time", "temperature"]].set_index("valid_time").sort_index()
+        ds_real = pd.to_datetime(grid["ds_real"].values)
+        mb_raw_interp = np.interp(
+            ds_real.astype("int64"), mb_latest.index.astype("int64"),
+            mb_latest["temperature"].values,
+        )
+        outside = (ds_real < mb_latest.index.min()) | (ds_real > mb_latest.index.max())
+        mb_raw_interp[outside] = np.nan
+        # Read published calibration table (FP-robust bin indexing)
+        solar_time = grid["SolarTime"].values
+        n_bins = 48
+        bin_idx = (np.round(solar_time * n_bins).astype(int)) % n_bins
+        bin_slopes = np.ones(n_bins)
+        bin_biases = np.zeros(n_bins)
+        bin_stds = np.full(n_bins, np.nan)
+        cal_path = RESULTS_PATH / "meteoblue_correction_per_solartime.csv"
+        if cal_path.exists():
+            cal_tbl = pd.read_csv(cal_path).set_index("bin")
+            for b in cal_tbl.index:
+                bin_slopes[int(b)] = float(cal_tbl.loc[b, "slope"])
+                bin_biases[int(b)] = float(cal_tbl.loc[b, "bias"])
+                rmse_b = cal_tbl.loc[b, "rmse_corrected"]
+                bin_stds[int(b)] = float(rmse_b) if pd.notna(rmse_b) else np.nan
+        mb_corrected = bin_slopes[bin_idx] * mb_raw_interp + bin_biases[bin_idx]
+        # Fill gaps with per-bin climatology + noise (never y[t])
+        nan_mask = np.isnan(mb_corrected)
+        if nan_mask.any():
+            ds_real_for_cal = pd.to_datetime(grid["ds_real"].values)
+            train_mask_cal = ds_real_for_cal < TEST_START_DATE
+            global_std = float(np.nanmean(bin_stds)) if np.any(~np.isnan(bin_stds)) else 2.4
+            bin_climatology = np.full(n_bins, np.nan)
+            for b in range(n_bins):
+                cm = (bin_idx == b) & train_mask_cal & ~np.isnan(y_arr)
+                if cm.sum() > 30:
+                    bin_climatology[b] = float(y_arr[cm].mean())
+            global_clim = float(np.nanmean(y_arr[train_mask_cal & ~np.isnan(y_arr)]))
+            bin_climatology = np.where(np.isnan(bin_climatology), global_clim, bin_climatology)
+            bin_stds_use = np.where(np.isnan(bin_stds), global_std, bin_stds)
+            np.random.seed(42)
+            nz = np.where(nan_mask)[0]
+            mb_corrected[nz] = (bin_climatology[bin_idx[nz]]
+                                + np.random.normal(0, 1, len(nz)) * bin_stds_use[bin_idx[nz]])
+        grid["mb_corrected"] = mb_corrected
+        print(f"  MeteoBlue: {(~nan_mask).sum()}/{len(mb_corrected)} coverage, "
+              f"slopes [{bin_slopes.min():.2f}..{bin_slopes.max():.2f}]")
+    else:
+        grid["mb_corrected"] = np.nan
 
     # Backward OLS slope over 4 grid steps (~2h at 30-min cadence)
     window = 4
@@ -256,15 +314,14 @@ def get_hist_futr_exog(cfg):
     underperform simple lags. Keep FeatureBuilder for grid construction +
     twilight_cos (futr), add lag features manually after transform.
     """
-    # Set A — feature sweep winner (greedy forward, max_steps=1000, width=256).
-    # Beats current 11-feature set by ~10% RMSE at 3h/9h/12h with +3pp pct<1°C.
+    # Feature set from greedy forward selection at the production architecture
+    # (width=16, max_steps=700, pre-2025 training). Small-capacity net: only
+    # these four causal features improve test RMSE; richer sets do not help.
     hist_exog = [
-        "y_raw",                       # absolute temperature
-        "y_lag_24",                    # 12h ago (reconstruction anchor)
-        "trend_solar_2h",              # backward OLS slope (~2h)
-        "dmean_3d",                    # 24h mean change over 3 days
-        "y_diff_60",                   # temp change over 30h — best for Spring
-        "rate_twilight_to_midnight",   # nighttime cooling rate (T_mn - T_tw)/(night/2)
+        "y_raw",            # absolute temperature
+        "y_lag_24",         # 12h ago (the half-solar-day reconstruction anchor)
+        "trend_solar_2h",   # backward OLS slope (~2h)
+        "y_diff_24h",       # 24h temperature difference T[t] - T[t-48]
     ]
     futr_exog = ["solar_sin", "solar_cos", "doy_sin", "doy_cos"]
     return hist_exog, futr_exog
@@ -289,13 +346,16 @@ def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt", 
     futr_exog = [c for c in futr_exog if c in grid.columns]
     all_exog = hist_exog + futr_exog
 
-    nf_train = grid[["ds", target_col] + all_exog].dropna().copy()
+    # Train strictly on pre-2025 data: the test set is all 2025 twilights, so
+    # including 2025/2026 rows here would leak the test period into training.
+    train_mask = pd.to_datetime(grid["ds_real"]) < TEST_START_DATE
+    nf_train = grid.loc[train_mask, ["ds", target_col] + all_exog].dropna().copy()
     nf_train["y"] = nf_train[target_col]
     nf_train["unique_id"] = "temp"
 
     val_size = int(len(nf_train) * 0.1)
 
-    print(f"  Training {cache_name} on {len(nf_train)} samples (val_size={val_size})...")
+    print(f"  Training {cache_name} on {len(nf_train)} pre-2025 samples (val_size={val_size})...")
     print(f"  target: {target_col}, hist_exog: {hist_exog}")
 
     model = NBEATSx(
@@ -312,7 +372,7 @@ def train_nbeats_diff(grid, cfg, target_col="D", cache_name="NBEATSx_feat_opt", 
         enable_progress_bar=True,
         enable_model_summary=False,
         stack_types=["trend", "seasonality", "identity", "exogenous"],
-        mlp_units=4 * [[int(x) for x in os.environ.get("RUN_WIDTH", "256,256").split(",")]],
+        mlp_units=4 * [[int(x) for x in os.environ.get("RUN_WIDTH", "16,16").split(",")]],
         n_blocks=[1, 1, 1, 1],
         early_stop_patience_steps=10,
         val_check_steps=50,

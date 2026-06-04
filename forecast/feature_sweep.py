@@ -185,33 +185,26 @@ def compute_all_features(grid):
     return grid
 
 
-# All candidate feature names
+# Candidate feature names. Trimmed from the original ~45-feature pool: dropped
+# the low-coverage solar anchors (y_sunrise/midday/midafternoon/sunset, which
+# returned NaN in earlier sweeps), the nonlinear/interaction terms that
+# consistently hurt (maxsr_sq, DTR_sq, trend_x_doy), and redundant short lags.
 ALL_CANDIDATES = [
-    # Current
-    "y_raw", "y_lag_3", "y_lag_6", "y_lag_12", "y_lag_24", "y_lag_48", "y_lag_96",
-    "trend_solar_2h", "DTR",
+    # Lags (the reconstruction anchor + a couple of distinct horizons)
+    "y_raw", "y_lag_12", "y_lag_24", "y_lag_48",
+    # Trend / rate
+    "trend_solar_2h", "trend_solar_4h", "cooling_rate_3h",
     # Rolling stats
-    "last_max_24h", "last_min_24h", "last_mean_24h", "last_std_24h",
+    "last_std_24h", "DTR",
     # Multi-day diffs
     "dmean_1d", "dmean_3d",
-    # Rates
-    "trend_solar_4h", "trend_solar_6h", "trend_accel",
-    "cooling_rate_3h", "cooling_rate_6h",
-    # Diurnal diffs
-    "y_diff_24h", "y_diff_48h", "y_diff_72h",
-    # Long-term trend (Spring residual correlations: 30h = best for Spring)
-    "y_diff_30h", "y_diff_39h", "y_diff_45h",
-    # Solar anchors
-    "y_sunrise", "y_midday", "y_midafternoon", "y_sunset", "y_midnight",
+    # Diurnal / long-term diffs (30h = best for Spring)
+    "y_diff_24h", "y_diff_30h", "y_diff_45h", "y_diff_72h",
     # DTR variants
     "DTR_3d", "dDTR_1d",
-    # FeatureBuilder columns (previously not swept)
-    "max_minus_sunrise", "temp_last_sunrise", "temp_last_midday", "temp_last_midnight",
-    "temp_solar_noon", "dTmax_1d", "dTmax_3d", "temp_trend_3d", "Tmean_24h",
-    "rate_sunrise_to_midday", "rate_midday_to_twilight", "rate_twilight_to_midnight",
-    "rate_midnight_to_sunrise", "velocity_sunrise", "velocity_noon",
-    # Nonlinear / interaction terms (memory: squared signals + season interactions help)
-    "maxsr_sq", "DTR_sq", "trend_x_doy",
+    # FeatureBuilder rate/anchor columns
+    "max_minus_sunrise", "temp_trend_3d", "dTmax_1d", "dTmax_3d", "Tmean_24h",
+    "rate_twilight_to_midnight", "rate_midnight_to_sunrise",
 ]
 
 FUTR_EXOG = ["solar_sin", "solar_cos", "doy_sin", "doy_cos"]
@@ -230,8 +223,9 @@ def evaluate_feature_set(grid, tw_events_test, hist_exog, max_steps=100, subsamp
     futr_exog = [c for c in FUTR_EXOG if c in grid.columns]
     all_exog = hist_exog + futr_exog
 
-    # Use full contiguous data (subsampling breaks time series windows)
-    nf_train = grid[["ds", "D"] + all_exog].dropna().copy()
+    # Train strictly pre-2025 (test set is all 2025; avoid leakage).
+    train_mask = pd.to_datetime(grid["ds_real"]) < TEST_START_DATE
+    nf_train = grid.loc[train_mask, ["ds", "D"] + all_exog].dropna().copy()
     nf_train["y"] = nf_train["D"]
     nf_train["unique_id"] = "temp"
     val_size = int(len(nf_train) * 0.1)
@@ -396,7 +390,7 @@ def main():
     print("PHASE 2: Forward selection (max_steps=1000, width=256)")
     print("=" * 70)
 
-    MAX_STEPS = int(os.environ.get("FS_MAX_STEPS", 1000))
+    MAX_STEPS = int(os.environ.get("FS_MAX_STEPS", 300))
     max_feats = os.environ.get("FS_MAX_FEATS")
     if max_feats is not None:
         max_feats = int(max_feats)
