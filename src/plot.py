@@ -153,7 +153,7 @@ def fig0_dataset_overview():
             & sunrise_mask
         ]["ds_local"].values
 
-        # 7. Load NBEATSx-Ridge forecasts at 9am local time for all twilights in window
+        # 7. Load NBEATSx-Ridge forecasts at midday for all twilights in window
         forecast_df = pd.read_csv(RESULTS_PATH / "paper_results_final.csv")
         forecast_df["twilight_time"] = pd.to_datetime(
             forecast_df["twilight_time"], format="mixed"
@@ -176,18 +176,18 @@ def fig0_dataset_overview():
         )
         forecast_df["forecast_local_hour"] = forecast_df["forecast_local"].dt.hour
 
-        # Get NBEATSx-Ridge forecasts issued mid-morning (~9h lead before twilight)
-        ridge_9am = forecast_df[
+        # Get NBEATSx-Ridge forecasts issued at midday (~6h lead before twilight)
+        ridge_midday = forecast_df[
             (forecast_df["model"] == "NBEATSx-Ridge")
-            & (np.abs(forecast_df["lead_time_hours"] - 9.0) < 0.5)
+            & (np.abs(forecast_df["lead_time_hours"] - 6.0) < 0.5)
         ].copy()
 
         # Match forecasts to window twilights
         forecast_points = []
         for tw_time in window_twilights:
             tw_local = pd.Timestamp(tw_time)
-            match = ridge_9am[
-                abs((ridge_9am["twilight_local"] - tw_local).dt.total_seconds()) < 7200
+            match = ridge_midday[
+                abs((ridge_midday["twilight_local"] - tw_local).dt.total_seconds()) < 7200
             ]
             if len(match) > 0:
                 forecast_points.append((tw_local, match.iloc[0]["forecast_temp"]))
@@ -264,7 +264,7 @@ def fig0_dataset_overview():
             future_sunrises = [s for s in window_sunrises if pd.Timestamp(s) > tw_time]
             if future_sunrises:
                 next_sunrise = pd.Timestamp(future_sunrises[0])
-                label_night = "Night (twilight to sunrise)" if first_night else None
+                label_night = "Night (astro. twilight to sunrise)" if first_night else None
                 ax2.axvspan(
                     tw_time,
                     next_sunrise,
@@ -315,7 +315,7 @@ def fig0_dataset_overview():
 
         # NBEATSx-Ridge forecast stars on all twilights
         for i, (tw_local, forecast_temp) in enumerate(forecast_points):
-            label = "NBEATSx-Blend \n morning forecast" if i == 0 else None
+            label = "NBEATSx+Ridge \n midday forecast" if i == 0 else None
             ax2.plot(
                 tw_local,
                 forecast_temp,
@@ -460,7 +460,7 @@ def fig2_rmse_heatmap():
         "RandomForest": "RF",
         "MLP": "MLP",
         "Prophet": "Prophet",
-        "NBEATSx-Ridge": "NBEATS-R",
+        "NBEATSx-Ridge": "NB+Ridge",
     }
     lead_times = [0.5, 1.0, 3.0, 6.0, 9.0, 12.0]
 
@@ -610,7 +610,7 @@ def fig3_rmse_vs_lead_time():
         "RandomForest": "Random Forest",
         "MLP": "MLP",
         "Linear": "Linear",
-        "NBEATSx-Ridge": "NBEATSx-Blend",
+        "NBEATSx-Ridge": "NBEATSx+Ridge",
     }
 
     lead_times = np.arange(0.5, 12.5, 0.5)
@@ -712,8 +712,8 @@ def fig3_rmse_vs_lead_time():
 
 
 def fig5_cdf_absolute_error():
-    """Figure 4 (paper): residual KDE (left) + absolute-error CDF (right) for the morning forecast (9 h before astro. twilight, ~10:20 am local on the equinox)."""
-    print("Generating Figure 5: residual KDE + CDF for the morning forecast (9 h lead)...")
+    """Figure 4 (paper): residual KDE (left) + absolute-error CDF (right) for the dome-opening forecast (3 h before astro. twilight)."""
+    print("Generating Figure 5: residual KDE + CDF for the dome-opening forecast (3 h lead)...")
 
     sns.set_theme(
         style="white",
@@ -737,7 +737,7 @@ def fig5_cdf_absolute_error():
         mb_results = pd.read_csv(mb_file)
         results = pd.concat([results, mb_results], ignore_index=True)
     results["abs_error"] = np.abs(results["error"])
-    at_3h = results[np.abs(results["lead_time_hours"] - 9.0) < 0.01]
+    at_3h = results[np.abs(results["lead_time_hours"] - 3.0) < 0.01]
 
     models_to_plot = [
         "Persistence",
@@ -763,7 +763,7 @@ def fig5_cdf_absolute_error():
         "RandomForest": "Random Forest",
         "MLP": "MLP",
         "Linear": "Linear",
-        "NBEATSx-Ridge": "NBEATSx-Blend",
+        "NBEATSx-Ridge": "NBEATSx+Ridge",
     }
 
     fig, (ax_kde, ax_cdf) = plt.subplots(1, 2, figsize=(16, 7))
@@ -771,7 +771,7 @@ def fig5_cdf_absolute_error():
         ax.minorticks_on()
 
     kde_xmin, kde_xmax = -4.0, 4.0
-    OUTLIER_THRESHOLD = 2.0  # |residual| > this is an outlier (~2x NBEATSx-Blend RMSE)
+    OUTLIER_THRESHOLD = 2.0  # |residual| > this is an outlier (~2x NBEATSx+Ridge RMSE)
 
     nbeats_ridge_pct = None
     outlier_lines = []  # (label, color, pct) for annotation
@@ -833,9 +833,9 @@ def fig5_cdf_absolute_error():
                       colors=cdf_colors["NBEATSx-Ridge"], linestyles="--", linewidth=1.5)
         ax_cdf.plot(1.0, nbeats_ridge_pct, "o",
                     color=cdf_colors["NBEATSx-Ridge"], markersize=8)
-        ax_cdf.text(1.05, nbeats_ridge_pct - 0.025,
+        ax_cdf.text(0.75, nbeats_ridge_pct + 0.04,
                     f"{nbeats_ridge_pct * 100:.0f}%",
-                    fontsize=12, va="center",
+                    fontsize=12, va="bottom", ha="center",
                     color=cdf_colors["NBEATSx-Ridge"], fontweight="bold")
     ax_cdf.set_xlabel("Absolute Error (°C)")
     ax_cdf.set_ylabel("Cumulative Probability")
@@ -871,7 +871,7 @@ def fig5_cdf_absolute_error():
 def fig6_seasonal_trend_analysis():
     """Figure 6: Seasonal residual KDE (left) + per-season CDF of |error| (right).
 
-    Mirrors fig5's structure but slices a single model (NBEATSx-Blend at the morning
+    Mirrors fig5's structure but slices a single model (NBEATSx+Ridge at the morning
     forecast) by Southern-hemisphere season instead of by model.
     """
     print("Generating Figure 6: Seasonal residual KDE + CDF...")
@@ -1312,12 +1312,12 @@ def fig8_comparison_nbeats_prophet_meteoblue():
         df = pd.concat([df, mb_df], ignore_index=True)
 
     # NBEATSx and Prophet at 9h lead (morning); MeteoBlue uses all available
-    nbeats_df = df[(df["model"] == "NBEATSx-Ridge") & (np.abs(df["lead_time_hours"] - 9.0) < 0.01)].copy()
-    prophet_df = df[(df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 9.0) < 0.5)].copy()
+    nbeats_df = df[(df["model"] == "NBEATSx-Ridge") & (np.abs(df["lead_time_hours"] - 6.0) < 0.01)].copy()
+    prophet_df = df[(df["model"] == "Prophet") & (np.abs(df["lead_time_hours"] - 6.0) < 0.5)].copy()
     meteoblue_df = df[df["model"] == "MeteoBlue"].copy()
 
-    print(f"  NBEATSx-Blend (9h): {len(nbeats_df)} points")
-    print(f"  Prophet (9h): {len(prophet_df)} points")
+    print(f"  NBEATSx+Ridge (6h): {len(nbeats_df)} points")
+    print(f"  Prophet (6h): {len(prophet_df)} points")
     print(f"  MeteoBlue (all): {len(meteoblue_df)} points")
 
     # Colors (matching fig3 / paper palette)
@@ -1338,8 +1338,8 @@ def fig8_comparison_nbeats_prophet_meteoblue():
     )
 
     datasets = [
-        (nbeats_df, "NBEATSx-Blend (morning)", colors["NBEATSx-Ridge"]),
-        (prophet_df, "Prophet (morning)", colors["Prophet"]),
+        (nbeats_df, "NBEATSx+Ridge (midday)", colors["NBEATSx-Ridge"]),
+        (prophet_df, "Prophet (midday)", colors["Prophet"]),
         (meteoblue_df, "MeteoBlue (NWP)", colors["MeteoBlue"]),
     ]
 
