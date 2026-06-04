@@ -660,7 +660,8 @@ def fig3_rmse_vs_lead_time():
 
     # Reference lines (in lead-hours data space)
     ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5, linewidth=1.0)
-    ax.axvline(9.0, color="#023e8a", linestyle=":", alpha=0.5, linewidth=1.5)
+    # Operationally critical 3h lead (M1M3 setpoint issue, ~4pm equinox), NOT 9h.
+    ax.axvline(3.0, color="#023e8a", linestyle=":", alpha=0.5, linewidth=1.5)
 
     # Dual lead-time axis: bottom = equinox-equivalent local clock; top = solar fraction phi.
     # Forecast target = astro. twilight (alt_sun = -20°) ~ 1h20min after sunset.
