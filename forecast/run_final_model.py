@@ -45,15 +45,15 @@ RIDGE_FEATS = [
     "trend_solar_2h", "solar_sin", "solar_cos", "doy_sin", "doy_cos",
     "trend_solar_4h", "velocity_noon", "dmean_1d",
 ]
-# Long-lead additions: multi-day trend + binned humidity + DIRECTIONAL wind.
-# Best config in the study (+trend+hw_dir_rhbin, docs/winter_spring_plan.md §3.10):
-# 9h winter -8.0%, spring -5.5%. RH is encoded as tercile dummies (rh_mid,
-# rh_high) rather than a linear coefficient because the spring humidity effect is
-# nonlinear (flat at low/mid RH, strong only at high RH); the binned form also
-# halves the short-lead variance penalty. Still LEAD-GATED (>= LEAD_GATE_HOURS).
-TREND_FEATS = ["y_diff_45h", "y_diff_30h", "last_std_24h", "DTR_3d"]
-HW_DIR_FEATS = ["rh_mid", "rh_high", "hum_std_24h",
-                "wind_u_par", "wind_u_perp", "wind_u_par_NE"]
+# Long-lead additions: SLIM set (5 features), trimmed from the 10-feature
+# +trend+hw_dir_rhbin config. The slim set matches its WS9 (1.599 vs 1.598) with
+# half the features and a slightly better 3h (see forecast/exp_humidity.py SLIM
+# sweep). Per group: 2 multi-day trend terms (y_diff_45h, last_std_24h), RH as
+# tercile dummies (rh_mid/rh_high; the spring humidity effect is nonlinear), and
+# a single directional-wind term (wind_u_par_NE, the spring NE-flow marker;
+# dropping wind entirely loses the spring gain). LEAD-GATED (>= LEAD_GATE_HOURS).
+TREND_FEATS = ["y_diff_45h", "last_std_24h"]
+HW_DIR_FEATS = ["rh_mid", "rh_high", "wind_u_par_NE"]
 LEAD_GATE_HOURS = 5.0   # leads >= this use the augmented feature set
 
 

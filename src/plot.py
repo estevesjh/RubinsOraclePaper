@@ -26,7 +26,8 @@ from config import DATA_PATH, FIGURES_PATH, RESULTS_PATH
 # Style settings
 plt.style.use("seaborn-v0_8-whitegrid")
 COLORS = {
-    "Persistence": "#8c564b",  # Brown - baseline
+    "Naive-Persistence": "#e63946",  # Coral red (same as MeteoBlue)
+    "Persistence": "#8c564b",  # Brown - trend-adjusted baseline
     "Persistence-Twilight": "#d62728",  # Red - twilight baseline
     "Linear": "#e377c2",  # Pink
     "RandomForest": "#7f7f7f",  # Gray
@@ -35,6 +36,7 @@ COLORS = {
     "NBEATSx-Ridge": "#17becf",  # Cyan - keep unchanged
 }
 MODEL_ORDER = [
+    "Naive-Persistence",
     "Persistence",
     "Persistence-Twilight",
     "Linear",
@@ -137,11 +139,20 @@ def fig0_dataset_overview():
 
         # 6. Get twilight and sunrise events for the window (in local time)
         # Derive sunrises from alt_sun crossing 0 from below (new CSV has no sunrise_temp column).
+        # Linearly interpolate the exact alt_sun=0 instant rather than snapping to the
+        # 15-min grid step where alt>=0 first holds: the grid step lands ~6 min after the
+        # true sunrise, so band right-edges would otherwise lag the temperature upturn.
         if "sunrise_temp" not in df.columns:
             alt_sun = pd.to_numeric(df["alt_sun"], errors="coerce").ffill()
-            sunrise_mask = (alt_sun.shift(1) < 0) & (alt_sun >= 0)
+            prev_alt = alt_sun.shift(1)
+            sunrise_mask = (prev_alt < 0) & (alt_sun >= 0)
+            frac = (-prev_alt) / (alt_sun - prev_alt)  # 0..1 between prev and current step
+            t_prev = df["ds_local"].shift(1)
+            step = df["ds_local"] - t_prev  # timedelta between consecutive samples
+            df["sunrise_exact"] = (t_prev + frac * step).where(sunrise_mask)
         else:
             sunrise_mask = df["sunrise_temp"].notna()
+            df["sunrise_exact"] = df["ds_local"].where(sunrise_mask)
         window_twilights = df[
             (df["ds_local"] >= window_start)
             & (df["ds_local"] <= window_end)
@@ -151,7 +162,7 @@ def fig0_dataset_overview():
             (df["ds_local"] >= window_start - pd.Timedelta(days=1))
             & (df["ds_local"] <= window_end + pd.Timedelta(days=1))
             & sunrise_mask
-        ]["ds_local"].values
+        ]["sunrise_exact"].values
 
         # 7. Load NBEATSx-Ridge forecasts at midday for all twilights in window
         forecast_df = pd.read_csv(RESULTS_PATH / "paper_results_final.csv")
@@ -191,6 +202,24 @@ def fig0_dataset_overview():
             ]
             if len(match) > 0:
                 forecast_points.append((tw_local, match.iloc[0]["forecast_temp"]))
+
+        # MeteoBlue daytime forecasts (lead < 12h, excludes the ~19h midnight run)
+        # for window twilights. Most days the daytime issuance is ~12:00 local
+        # (~7h lead); Jun 5 only has a ~15:30 issuance (~3.7h lead), so match the
+        # closest-to-7h daytime issuance per twilight rather than a tight band.
+        meteoblue_day = forecast_df[
+            (forecast_df["model"] == "MeteoBlue")
+            & (forecast_df["lead_time_hours"] < 12.0)
+        ].copy()
+        meteoblue_points = []
+        for tw_time in window_twilights:
+            tw_local = pd.Timestamp(tw_time)
+            match = meteoblue_day[
+                abs((meteoblue_day["twilight_local"] - tw_local).dt.total_seconds()) < 7200
+            ]
+            if len(match) > 0:
+                best = match.iloc[(match["lead_time_hours"] - 7.0).abs().argmin()]
+                meteoblue_points.append((tw_local, best["forecast_temp"]))
 
         # 8. Create figure with 3 rows (middle and bottom share x-axis, no gap)
         from matplotlib.gridspec import GridSpec
@@ -236,7 +265,7 @@ def fig0_dataset_overview():
         window_center = window_start + (window_end - window_start) / 2
         y_pos = ax1.get_ylim()[1] - 0.05 * (ax1.get_ylim()[1] - ax1.get_ylim()[0])
         ax1.annotate(
-            "Representative\n5-day window",
+            "5-day window",
             xy=(window_center, y_pos),
             ha="center",
             va="top",
@@ -264,12 +293,12 @@ def fig0_dataset_overview():
             future_sunrises = [s for s in window_sunrises if pd.Timestamp(s) > tw_time]
             if future_sunrises:
                 next_sunrise = pd.Timestamp(future_sunrises[0])
-                label_night = "Night (astro. twilight to sunrise)" if first_night else None
+                label_night = "Night \n"+"(twilight to sunrise)" if first_night else None
                 ax2.axvspan(
                     tw_time,
                     next_sunrise,
                     color="#2c3e50",
-                    alpha=0.05,
+                    alpha=0.15,
                     label=label_night,
                 )
                 first_night = False
@@ -281,15 +310,6 @@ def fig0_dataset_overview():
             color="#053061",
             linewidth=2.0,
             label="Temperature",
-        )
-        # Twilight-trend baseline (thicker, darker)
-        ax2.plot(
-            window_data["ds_local"],
-            window_data["twilight_baseline"],
-            color="firebrick",
-            linewidth=2.0,
-            linestyle="--",
-            label="Twilight-Trend",
         )
         # Add markers at twilight anchor points
         window_tw_data = window_data[window_data["twilight_temp"].notna()]
@@ -328,10 +348,25 @@ def fig0_dataset_overview():
                 zorder=10,
             )
 
+        # MeteoBlue daytime forecast (coral down-triangle) on all twilights
+        for i, (tw_local, forecast_temp) in enumerate(meteoblue_points):
+            label = "MeteoBlue \n forecast" if i == 0 else None
+            ax2.plot(
+                tw_local,
+                forecast_temp,
+                marker="v",
+                markersize=10,
+                color="#e63946",
+                markeredgecolor="black",
+                markeredgewidth=0.5,
+                label=label,
+                zorder=10,
+            )
+
         ax2.set_ylabel("Temperature (°C)")
-        ax2.set_title("Representative 5-Day Window")
+        ax2.set_title("5-Day Window")
         ax2.set_xlim(window_start, window_end)
-        ax2.legend(loc="lower right", fontsize=11)
+        ax2.legend(loc="upper left", fontsize=11, ncol=2)
         paper_ticks(ax2)
 
         # Hide x-tick labels on ax2 (shared with ax3)
@@ -347,7 +382,7 @@ def fig0_dataset_overview():
             future_sunrises = [s for s in window_sunrises if pd.Timestamp(s) > tw_time]
             if future_sunrises:
                 next_sunrise = pd.Timestamp(future_sunrises[0])
-                ax3.axvspan(tw_time, next_sunrise, color="#2c3e50", alpha=0.05)
+                ax3.axvspan(tw_time, next_sunrise, color="#2c3e50", alpha=0.15)
 
         # Twilight markers (match ax2 styling)
         for tw_time in window_twilights:
@@ -456,7 +491,7 @@ def fig2_rmse_heatmap():
     # Define models and lead times
     models = ["Persistence", "RandomForest", "MLP", "Prophet", "NBEATSx-Ridge"]
     model_abbrev = {
-        "Persistence": "Pers.",
+        "Persistence": "Trend-adj. Pers.",
         "RandomForest": "RF",
         "MLP": "MLP",
         "Prophet": "Prophet",
@@ -605,7 +640,7 @@ def fig3_rmse_vs_lead_time():
     }
 
     line_labels = {
-        "Persistence": "Persistence",
+        "Persistence": "Trend-adj. Pers.",
         "Prophet": "Prophet",
         "RandomForest": "Random Forest",
         "MLP": "MLP",
@@ -658,6 +693,26 @@ def fig3_rmse_vs_lead_time():
             markersize=4,
         )
 
+    # Naive persistence: single point at 12h with bootstrap errorbars
+    naive_data = results[results["model"] == "Naive-Persistence"]
+    if len(naive_data) > 0:
+        naive_12 = naive_data[np.abs(naive_data["lead_time_hours"] - 12.0) < 0.01]
+        if len(naive_12) > 0:
+            errors = naive_12["error"].values
+            rmse = np.sqrt(np.mean(errors ** 2))
+            boot_rmses = np.array([
+                np.sqrt(np.mean(np.random.choice(errors, size=len(errors), replace=True) ** 2))
+                for _ in range(N_BOOT)
+            ])
+            lo = rmse - np.percentile(boot_rmses, 2.5)
+            hi = np.percentile(boot_rmses, 97.5) - rmse
+            ax.errorbar(
+                12.0, rmse, yerr=[[lo], [hi]],
+                fmt="D", markersize=10, color="#e63946", capsize=5,
+                capthick=2, elinewidth=2, label="Naive Persistence",
+                zorder=10,
+            )
+
     # Reference lines (in lead-hours data space)
     ax.axhline(1.0, color="gray", linestyle="--", alpha=0.5, linewidth=1.0)
     # Operationally critical 3h lead (M1M3 setpoint issue, ~4pm equinox), NOT 9h.
@@ -699,7 +754,7 @@ def fig3_rmse_vs_lead_time():
         title=r"Top axis: solar fraction $\phi$ (0 sunrise, 0.5 sunset)",
         title_fontsize=10,
     )
-    ax.set_ylim(0, 3.0)
+    ax.set_ylim(0, 3.25)
 
     for spine in ax.spines.values():
         spine.set_color("black")
@@ -759,7 +814,7 @@ def fig5_cdf_absolute_error():
     }
 
     cdf_labels = {
-        "Persistence": "Persistence",
+        "Persistence": "Trend-adj. Pers.",
         "Prophet": "Prophet",
         "RandomForest": "Random Forest",
         "MLP": "MLP",
@@ -822,7 +877,7 @@ def fig5_cdf_absolute_error():
     ax_kde.axvline(0.0, color="black", linestyle="--", alpha=0.4, linewidth=1.0)
     ax_kde.set_xlabel("Residual (°C)")
     ax_kde.set_ylabel("Density")
-    ax_kde.set_title("Morning forecast: residual distribution")
+    ax_kde.set_title("Short-term forecast (3h lead): residual distribution")
     ax_kde.set_xlim(kde_xmin, kde_xmax)
     ax_kde.legend(loc="upper left", fontsize=15, framealpha=0.9)
 
@@ -840,7 +895,7 @@ def fig5_cdf_absolute_error():
                     color=cdf_colors["NBEATSx-Ridge"], fontweight="bold")
     ax_cdf.set_xlabel("Absolute Error (°C)")
     ax_cdf.set_ylabel("Cumulative Probability")
-    ax_cdf.set_title("Morning forecast: CDF of |error|")
+    ax_cdf.set_title("Short-term forecast (3h lead): CDF of |error|")
     ax_cdf.set_xlim(0, 4.0)
     ax_cdf.set_ylim(0, 1)
 
@@ -1069,7 +1124,7 @@ def fig7_rate_forecast():
         s=30,
         c="gray",
         marker="x",
-        label=f"Persistence (RMSE={pers_rmse:.2f})",
+        label=f"Trend-adj. Pers. (RMSE={pers_rmse:.2f})",
     )
     # NBEATSx-Ridge
     ax1.scatter(
@@ -1147,7 +1202,7 @@ def fig7_rate_forecast():
     # Persistence CDF
     sorted_pers_err = np.sort(np.abs(df["pers_error"]))
     cdf_pers = np.arange(1, len(sorted_pers_err) + 1) / len(sorted_pers_err)
-    ax4.plot(sorted_pers_err, cdf_pers, color="gray", linewidth=2, label="Persistence")
+    ax4.plot(sorted_pers_err, cdf_pers, color="gray", linewidth=2, label="Trend-adj. Pers.")
 
     # NBEATSx-Ridge CDF
     sorted_err = np.sort(df["abs_error"])

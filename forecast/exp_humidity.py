@@ -343,17 +343,22 @@ def main():
     RH_BINS = ["rh_mid", "rh_high"]
     HW_DIR_BINNED = RH_BINS + ["hum_std_24h"] + WDIR_FEATS  # binned RH replaces linear humidity
     WTEND = ["dws_6h", "wdir_var_24h"]                       # wind tendency (user's idea)
+    # SLIM variants: trim each group to find the minimum feature set that keeps
+    # the WS9 gain. Production (+trend+hw_dir_rhbin) = 10 long-lead feats.
+    TREND2 = ["y_diff_45h", "last_std_24h"]                  # 4 -> 2 trend
+    WIND1 = ["wind_u_par_NE"]                                # 3 -> 1 wind (spring marker)
+    WIND2 = ["wind_u_par", "wind_u_perp"]                    # 3 -> 2 wind
     variants = {
         "BASE": RIDGE_BASE,
         "+trend": RIDGE_BASE + TREND_FEATS,
-        "+hw": RIDGE_BASE + HW_FEATS,
-        "+trend+hw": RIDGE_BASE + TREND_FEATS + HW_FEATS,
-        "+hw_dir": RIDGE_BASE + HW_DIR,
-        "+trend+hw_dir": RIDGE_BASE + TREND_FEATS + HW_DIR,
-        "+trend+rhbin": RIDGE_BASE + TREND_FEATS + RH_BINS,
-        "+trend+hw_dir_rhbin": RIDGE_BASE + TREND_FEATS + HW_DIR_BINNED,  # PRODUCTION
-        "+trend+hw_dir+rhbin": RIDGE_BASE + TREND_FEATS + HW_DIR + RH_BINS,
-        "+trend+hw_dir_rhbin+wtend": RIDGE_BASE + TREND_FEATS + HW_DIR_BINNED + WTEND,
+        "+trend+hw_dir_rhbin": RIDGE_BASE + TREND_FEATS + HW_DIR_BINNED,  # PRODUCTION (10)
+        # --- slimmed: fewer features per group ---
+        "SLIM trend2+rh": RIDGE_BASE + TREND2 + RH_BINS,                       # 4
+        "SLIM trend2+rh+wind1": RIDGE_BASE + TREND2 + RH_BINS + WIND1,         # 5
+        "SLIM trend2+rh+hum+wind1": RIDGE_BASE + TREND2 + RH_BINS + ["hum_std_24h"] + WIND1,  # 6
+        "SLIM trend2+rh+wind2": RIDGE_BASE + TREND2 + RH_BINS + WIND2,         # 6
+        "SLIM trend4+rh+wind1": RIDGE_BASE + TREND_FEATS + RH_BINS + WIND1,    # 7
+        "SLIM trend4+rh_only": RIDGE_BASE + TREND_FEATS + RH_BINS,             # 6 (no wind/hum)
     }
     # Evaluate every variant once; humidity/wind imputed so the twilight set is
     # IDENTICAL across variants (fixes the coverage confound).
